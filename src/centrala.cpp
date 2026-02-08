@@ -10,6 +10,16 @@
 #include <Wire.h>
 #include "RTClib.h"
 
+// ================== PARAMETRY ==================
+#define FIRMWARE_VERSION "1.1"
+#define SET_RTC_ON_COMPILE false
+#define MAX_SCAN_TIME_SEC     60
+#define MAX_SCALES_TOTAL      10
+#define MAX_SCALES_TO_READ     3
+
+#define GPRS_MAX_RETRIES       3
+#define GPRS_RETRY_DELAY_MS    60000UL
+
 // ================== PINY TTGO T-CALL ==================
 #define MODEM_RST        5
 #define MODEM_PWRKEY     4
@@ -23,17 +33,14 @@
 #define RTC_SQW_PIN 32
 RTC_DS3231 rtc;
 
+// ================== HARMONOGRAM ==================
+const int SCHEDULE_HOURS[] = {17, 17};      // Godziny: 6:xx i 20:xx
+const int SCHEDULE_MINUTES[] = {50, 55};     // Minuty: x:06 i x:05
+const int SCHEDULE_COUNT = 2;
+
 // ================== BLE UUID ==================
 static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
 static BLEUUID charUUID   ("beb5483e-36e1-4688-b7f5-ea07361b26a8");
-
-// ================== PARAMETRY ==================
-#define MAX_SCAN_TIME_SEC     180
-#define MAX_SCALES_TOTAL      10
-#define MAX_SCALES_TO_READ     3
-
-#define GPRS_MAX_RETRIES       3
-#define GPRS_RETRY_DELAY_MS    60000UL
 
 // ================== IDENTYFIKACJA ==================
 const char GATEWAY_ID[] = "CENTRALA_01";
@@ -49,6 +56,11 @@ const char PASS[] = "";
 const char SERVER[] = "srv92298.seohost.com.pl";
 const int  PORT = 80;
 const char PATH[] = "/waga_odbior.php";
+
+// ================== BATERIA CENTRALI ==================
+#define CENTRAL_BAT_ADC_PIN 35  // GPIO35 - ADC dla TTGO T-Call
+float centralBatteryVoltage = 0.0;
+float centralTemperature = 0.0;  // Temperatura z DS3231
 
 // ================== STRUKTURY ==================
 struct ScaleData {
@@ -74,7 +86,7 @@ BLEClient* pClient;
 volatile bool scaleDetected = false;
 BLEAddress detectedAddress("");
 
-// ================== RTC ==================
+// ================== FUNKCJE RTC ==================
 String nowStr() {
   DateTime now = rtc.now();
   char buf[20];
@@ -82,6 +94,104 @@ String nowStr() {
           now.year(), now.month(), now.day(),
           now.hour(), now.minute(), now.second());
   return String(buf);
+}
+
+void rtc_init() {
+  Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
+  
+  if (!rtc.begin()) {
+    Serial.println("❌ DS3231 ERROR!");
+    while (1) delay(10);
+  }
+  
+  #if SET_RTC_ON_COMPILE
+    Serial.println("⚙️ Ustawiam czas z kompilacji...");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  #else
+    if (rtc.lostPower()) {
+      Serial.println("⚠️ RTC stracił zasilanie - wymagane ustawienie czasu!");
+      Serial.println("⚠️ Ustaw SET_RTC_ON_COMPILE na true i przekompiluj");
+    }
+  #endif
+  
+  rtc.disableAlarm(1);
+  rtc.disableAlarm(2);
+  rtc.clearAlarm(1);
+  rtc.clearAlarm(2);
+  
+  Serial.println("✅ DS3231 OK");
+}
+
+DateTime getNextScheduledTime(DateTime now) {
+  int currentHour = now.hour();
+  int currentMinute = now.minute();
+  
+  for (int i = 0; i < SCHEDULE_COUNT; i++) {
+    int scheduleHour = SCHEDULE_HOURS[i];
+    int scheduleMinute = SCHEDULE_MINUTES[i];
+    
+    // Sprawdź czy ta godzina jeszcze nie minęła
+    if (scheduleHour > currentHour || 
+        (scheduleHour == currentHour && scheduleMinute > currentMinute)) {
+      return DateTime(now.year(), now.month(), now.day(), 
+                     scheduleHour, scheduleMinute, 0);
+    }
+  }
+  
+  // Wszystkie dzisiejsze alarmy minęły - ustaw na jutro pierwszy
+  DateTime tomorrow = now + TimeSpan(1, 0, 0, 0);
+  return DateTime(tomorrow.year(), tomorrow.month(), tomorrow.day(), 
+                 SCHEDULE_HOURS[0], SCHEDULE_MINUTES[0], 0);
+}
+
+void rtc_set_alarm() {
+  DateTime now = rtc.now();
+  DateTime nextAlarm = getNextScheduledTime(now);
+  
+  Serial.println("\n╔══════════════════════════════╗");
+  Serial.println("║   NASTĘPNE WYBUDZENIE        ║");
+  Serial.println("╚══════════════════════════════╝");
+  
+  char buffer[20];
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+          now.year(), now.month(), now.day(),
+          now.hour(), now.minute(), now.second());
+  Serial.print("⏰ Teraz:      ");
+  Serial.println(buffer);
+  
+  sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d", 
+          nextAlarm.year(), nextAlarm.month(), nextAlarm.day(),
+          nextAlarm.hour(), nextAlarm.minute(), nextAlarm.second());
+  Serial.print("⏰ Następny:   ");
+  Serial.println(buffer);
+  Serial.println("╚══════════════════════════════╝\n");
+  
+  rtc.setAlarm1(nextAlarm, DS3231_A1_Minute);  // Dopasowanie do minuty
+  rtc.clearAlarm(1);
+}
+
+// ================== BATERIA CENTRALI ==================
+float readCentralBattery() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(CENTRAL_BAT_ADC_PIN, ADC_11db);
+  
+  uint32_t sum = 0;
+  const int samples = 16;
+  
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(CENTRAL_BAT_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  
+  float raw = sum / (float)samples;
+  // TTGO T-Call ma dzielnik 1:2, więc napięcie = (raw/4095)*3.3*2
+  float voltage = (raw / 4095.0) * 3.3 * 2.0;
+  
+  Serial.print("🔋 Bateria centrali: ");
+  Serial.print(voltage, 2);
+  Serial.println(" V");
+  
+  return voltage;
 }
 
 // ================== MAC HANDLING ==================
@@ -129,7 +239,7 @@ bool processScale(BLEAddress addr) {
   if (ch->canWrite()) {
     String timeCmd = "TIME:" + nowStr();
     ch->writeValue(timeCmd.c_str());
-    Serial.print("⏱ Wysłano czas");
+    Serial.println("⏱ Wysłano czas");
   }
 
   pClient->disconnect();
@@ -178,6 +288,9 @@ bool initGPRS() {
 String buildJson() {
   String json = "{";
   json += "\"gateway_id\":\"" + String(GATEWAY_ID) + "\",";
+  json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";  // Zmieniono nazwę
+  json += "\"battery\":" + String(centralBatteryVoltage, 2) + ",";  // Zmieniono nazwę
+  json += "\"temp\":" + String(centralTemperature, 2) + ",";  // DODANO
   json += "\"timestamp\":\"" + nowStr() + "\",";
   json += "\"measurements\":[";
 
@@ -242,17 +355,43 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
 
-  Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
-  rtc.begin();
+  // Inicjalizacja RTC
+  rtc_init();
 
-  Serial.println("\n🐝 CENTRALA PASIECZNA v1.4 – GPRS RETRY");
+  Serial.println("\n╔════════════════════════════════╗");
+  Serial.println("║  🐝 CENTRALA PASIECZNA        ║");
+  Serial.print("║  Firmware: ");
+  Serial.print(FIRMWARE_VERSION);
+  Serial.println("                ║");
+  Serial.println("╚════════════════════════════════╝");
+  
+  DateTime now = rtc.now();
+  Serial.print("📅 Czas: ");
+  Serial.print(nowStr());
+  Serial.print(" (");
+  Serial.print(rtc.getTemperature());
+  Serial.println("°C)");
+  
+  // Pomiar baterii centrali
+  centralBatteryVoltage = readCentralBattery();
 
+  // Odczyt temperatury z DS3231
+  centralTemperature = rtc.getTemperature();
+  Serial.print("🌡️ Temperatura DS3231: ");
+  Serial.print(centralTemperature, 2);
+  Serial.println("°C");
+
+  // Inicjalizacja BLE
   BLEDevice::init("Centrala");
   pClient = BLEDevice::createClient();
 
   pScan = BLEDevice::getScan();
   pScan->setAdvertisedDeviceCallbacks(new ScanCallbacks());
   pScan->setActiveScan(true);
+
+  Serial.println("\n╔══════════════════════════════╗");
+  Serial.println("║   SKANOWANIE BLE             ║");
+  Serial.println("╚══════════════════════════════╝");
 
   unsigned long scanStart = millis();
   pScan->start(MAX_SCAN_TIME_SEC, false);
@@ -272,16 +411,27 @@ void setup() {
 
   pScan->stop();
 
+  Serial.print("\n✅ Znaleziono: ");
+  Serial.print(scaleCount);
+  Serial.println(" wag\n");
+
+  // Wysyłanie przez GPRS
   if (scaleCount > 0 && initGPRS()) {
     String json = buildJson();
+    Serial.println("\n📤 JSON do wysłania:");
     Serial.println(json);
     sendWithRetry(json);
     modem.gprsDisconnect();
   }
 
-  Serial.println("😴 Deep sleep");
+  // Ustaw alarm na następne skanowanie
+  rtc_set_alarm();
+
+  Serial.println("😴 Deep sleep - wybudzenie przez RTC alarm");
   pinMode(RTC_SQW_PIN, INPUT_PULLUP);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_SQW_PIN, LOW);
+
+  delay(2000);
   esp_deep_sleep_start();
 }
 
