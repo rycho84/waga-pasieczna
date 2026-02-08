@@ -11,8 +11,8 @@
 #include "RTClib.h"
 
 // ================== PARAMETRY ==================
-#define FIRMWARE_VERSION "1.1"
-#define SET_RTC_ON_COMPILE false
+#define FIRMWARE_VERSION "1.2.0"
+#define SET_RTC_ON_COMPILE false  // Zmień na true aby ustawić czas przy kompilacji
 #define MAX_SCAN_TIME_SEC     60
 #define MAX_SCALES_TOTAL      10
 #define MAX_SCALES_TO_READ     3
@@ -34,8 +34,8 @@
 RTC_DS3231 rtc;
 
 // ================== HARMONOGRAM ==================
-const int SCHEDULE_HOURS[] = {17, 17};      // Godziny: 6:xx i 20:xx
-const int SCHEDULE_MINUTES[] = {50, 55};     // Minuty: x:06 i x:05
+const int SCHEDULE_HOURS[] = {6, 20};      // Godziny: 6:xx i 20:xx
+const int SCHEDULE_MINUTES[] = {6, 5};     // Minuty: x:06 i x:05
 const int SCHEDULE_COUNT = 2;
 
 // ================== BLE UUID ==================
@@ -237,10 +237,13 @@ bool processScale(BLEAddress addr) {
   }
 
   if (ch->canWrite()) {
-    String timeCmd = "TIME:" + nowStr();
+    DateTime now = rtc.now();
+    uint32_t timestamp = now.unixtime();
+    String timeCmd = "TIME:" + String(timestamp);
     ch->writeValue(timeCmd.c_str());
-    Serial.println("⏱ Wysłano czas");
-  }
+    Serial.print("⏱ Wysłano czas: ");
+    Serial.println(nowStr());
+}
 
   pClient->disconnect();
   delay(300);
@@ -288,9 +291,9 @@ bool initGPRS() {
 String buildJson() {
   String json = "{";
   json += "\"gateway_id\":\"" + String(GATEWAY_ID) + "\",";
-  json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";  // Zmieniono nazwę
-  json += "\"battery\":" + String(centralBatteryVoltage, 2) + ",";  // Zmieniono nazwę
-  json += "\"temp\":" + String(centralTemperature, 2) + ",";  // DODANO
+  json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
+  json += "\"battery\":" + String(centralBatteryVoltage, 2) + ",";
+  json += "\"temp\":" + String(centralTemperature, 2) + ",";
   json += "\"timestamp\":\"" + nowStr() + "\",";
   json += "\"measurements\":[";
 
@@ -374,7 +377,7 @@ void setup() {
   
   // Pomiar baterii centrali
   centralBatteryVoltage = readCentralBattery();
-
+  
   // Odczyt temperatury z DS3231
   centralTemperature = rtc.getTemperature();
   Serial.print("🌡️ Temperatura DS3231: ");
