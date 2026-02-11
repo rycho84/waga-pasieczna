@@ -11,11 +11,11 @@
 #include "RTClib.h"
 
 // ================== PARAMETRY ==================
-#define FIRMWARE_VERSION "1.2.0"
+#define FIRMWARE_VERSION "1.3.0"
 #define SET_RTC_ON_COMPILE false  // Zmień na true aby ustawić czas przy kompilacji
-#define MAX_SCAN_TIME_SEC     60
+#define MAX_SCAN_TIME_SEC     240
 #define MAX_SCALES_TOTAL      10
-#define MAX_SCALES_TO_READ     3
+#define MAX_SCALES_TO_READ     1
 
 #define GPRS_MAX_RETRIES       3
 #define GPRS_RETRY_DELAY_MS    60000UL
@@ -26,6 +26,7 @@
 #define MODEM_POWER_ON   23
 #define MODEM_TX         27
 #define MODEM_RX         26
+#define LED_PIN          25 
 
 // ================== RTC ==================
 #define RTC_SDA_PIN 21
@@ -34,8 +35,8 @@
 RTC_DS3231 rtc;
 
 // ================== HARMONOGRAM ==================
-const int SCHEDULE_HOURS[] = {6, 20};      // Godziny: 6:xx i 20:xx
-const int SCHEDULE_MINUTES[] = {6, 5};     // Minuty: x:06 i x:05
+const int SCHEDULE_HOURS[] = {5, 19};      // Godziny: 6:xx i 20:xx
+const int SCHEDULE_MINUTES[] = {58, 58};     // Minuty: x:06 i x:05
 const int SCHEDULE_COUNT = 2;
 
 // ================== BLE UUID ==================
@@ -63,10 +64,21 @@ float centralBatteryVoltage = 0.0;
 float centralTemperature = 0.0;  // Temperatura z DS3231
 
 // ================== STRUKTURY ==================
+struct DriftData {
+  int32_t drift_ppm_avg;
+  int32_t drift_ppm_last;
+  uint32_t successful_syncs;
+  uint32_t days_without_sync;
+  int32_t min_drift_seen;
+  int32_t max_drift_seen;
+  bool has_drift_data;
+};
+
 struct ScaleData {
   String device_id;
   float weight;
   float battery;
+  DriftData drift;
   bool received;
 };
 
@@ -209,6 +221,59 @@ void markHandled(BLEAddress addr) {
   }
 }
 
+// ================== PARSOWANIE DRYFU ==================
+DriftData parseDriftData(String driftStr) {
+  DriftData drift;
+  drift.has_drift_data = false;
+  
+  // Format: "D:drift_avg;drift_last;syncs;days_wo_sync;min;max"
+  if (!driftStr.startsWith("D:")) {
+    return drift;
+  }
+  
+  driftStr = driftStr.substring(2); // Usuń "D:"
+  
+  int idx = 0;
+  String parts[6];
+  int partCount = 0;
+  
+  // Rozdziel po średnikach
+  while (driftStr.length() > 0 && partCount < 6) {
+    int sep = driftStr.indexOf(';');
+    if (sep >= 0) {
+      parts[partCount++] = driftStr.substring(0, sep);
+      driftStr = driftStr.substring(sep + 1);
+    } else {
+      parts[partCount++] = driftStr;
+      break;
+    }
+  }
+  
+  if (partCount >= 6) {
+    drift.drift_ppm_avg = parts[0].toInt();
+    drift.drift_ppm_last = parts[1].toInt();
+    drift.successful_syncs = parts[2].toInt();
+    drift.days_without_sync = parts[3].toInt();
+    drift.min_drift_seen = parts[4].toInt();
+    drift.max_drift_seen = parts[5].toInt();
+    drift.has_drift_data = true;
+    
+    Serial.println("📊 DANE DRYFU:");
+    Serial.print("   Avg: ");
+    Serial.print(drift.drift_ppm_avg);
+    Serial.println(" ppm");
+    Serial.print("   Last: ");
+    Serial.print(drift.drift_ppm_last);
+    Serial.println(" ppm");
+    Serial.print("   Syncs: ");
+    Serial.println(drift.successful_syncs);
+    Serial.print("   Days w/o sync: ");
+    Serial.println(drift.days_without_sync);
+  }
+  
+  return drift;
+}
+
 // ================== OBSŁUGA WAGI ==================
 bool processScale(BLEAddress addr) {
   Serial.print("🔗 Łączenie z wagą: ");
@@ -224,16 +289,38 @@ bool processScale(BLEAddress addr) {
 
   if (ch->canRead()) {
     String val = ch->readValue().c_str();
-    int sep = val.indexOf(';');
-    if (sep < 0) { pClient->disconnect(); return false; }
-
+    Serial.print("📥 Dane surowe: ");
+    Serial.println(val);
+    
+    // Format: "masa;napiecie;D:drift_data"
+    // lub stary format: "masa;napiecie"
+    
+    int firstSep = val.indexOf(';');
+    if (firstSep < 0) { pClient->disconnect(); return false; }
+    
+    int secondSep = val.indexOf(';', firstSep + 1);
+    
     scales[scaleCount].device_id = addr.toString().c_str();
-    scales[scaleCount].weight   = val.substring(0, sep).toFloat();
-    scales[scaleCount].battery  = val.substring(sep + 1).toFloat();
+    scales[scaleCount].weight   = val.substring(0, firstSep).toFloat();
+    
+    if (secondSep >= 0) {
+      // Nowy format z dryfem
+      scales[scaleCount].battery  = val.substring(firstSep + 1, secondSep).toFloat();
+      String driftStr = val.substring(secondSep + 1);
+      scales[scaleCount].drift = parseDriftData(driftStr);
+    } else {
+      // Stary format bez dryfu
+      scales[scaleCount].battery  = val.substring(firstSep + 1).toFloat();
+      scales[scaleCount].drift.has_drift_data = false;
+    }
+    
     scales[scaleCount].received = true;
 
-    Serial.print("📥 Dane: ");
-    Serial.println(val);
+    Serial.print("✅ Masa: ");
+    Serial.print(scales[scaleCount].weight, 2);
+    Serial.print(" kg, Bateria: ");
+    Serial.print(scales[scaleCount].battery, 2);
+    Serial.println(" V");
   }
 
   if (ch->canWrite()) {
@@ -243,7 +330,7 @@ bool processScale(BLEAddress addr) {
     ch->writeValue(timeCmd.c_str());
     Serial.print("⏱ Wysłano czas: ");
     Serial.println(nowStr());
-}
+  }
 
   pClient->disconnect();
   delay(300);
@@ -270,6 +357,7 @@ class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 
 // ================== GPRS INIT ==================
 bool initGPRS() {
+  Serial.println("📶 Inicjalizacja modemu...");
   SerialAT.begin(9600, SERIAL_8N1, MODEM_RX, MODEM_TX);
   delay(3000);
 
@@ -280,9 +368,46 @@ bool initGPRS() {
   delay(1000);
   digitalWrite(MODEM_PWRKEY, LOW);
 
-  if (!modem.restart()) return false;
-  if (!modem.waitForNetwork(60000)) return false;
-  if (!modem.gprsConnect(APN, USER, PASS)) return false;
+  Serial.println("🔄 Restart modemu...");
+  if (!modem.restart()) {
+    Serial.println("❌ BŁĄD: modem.restart() nie powiódł się");
+    return false;
+  }
+  Serial.println("✅ Modem OK");
+
+  String modemInfo = modem.getModemInfo();
+  Serial.print("ℹ️ Modem info: ");
+  Serial.println(modemInfo);
+
+  Serial.println("📶 Czekam na sieć (60s)...");
+  if (!modem.waitForNetwork(60000)) {
+    Serial.println("❌ BŁĄD: Brak sieci GSM");
+    Serial.print("   Stan sieci: ");
+    Serial.println(modem.getRegistrationStatus());
+    return false;
+  }
+  Serial.println("✅ Sieć GSM OK");
+
+  Serial.print("📶 Siła sygnału: ");
+  Serial.println(modem.getSignalQuality());
+
+  Serial.println("🌐 Łączę z GPRS...");
+  Serial.print("   APN: ");
+  Serial.println(APN);
+  if (!modem.gprsConnect(APN, USER, PASS)) {
+    Serial.println("❌ BŁĄD: gprsConnect() nie powiódł się");
+    return false;
+  }
+  Serial.println("✅ GPRS połączony");
+
+  Serial.print("🌐 Lokalny IP: ");
+  Serial.println(modem.localIP());
+
+  Serial.println("🔌 Łączę z serwerem...");
+  Serial.print("   Serwer: ");
+  Serial.print(SERVER);
+  Serial.print(":");
+  Serial.println(PORT);
 
   return true;
 }
@@ -307,6 +432,19 @@ String buildJson() {
     json += "\"device_id\":\"" + scales[i].device_id + "\",";
     json += "\"weight\":" + String(scales[i].weight, 2) + ",";
     json += "\"battery\":" + String(scales[i].battery, 2);
+    
+    // Dodaj dane dryfu jeśli dostępne
+    if (scales[i].drift.has_drift_data) {
+      json += ",\"drift\":{";
+      json += "\"avg\":" + String(scales[i].drift.drift_ppm_avg) + ",";
+      json += "\"last\":" + String(scales[i].drift.drift_ppm_last) + ",";
+      json += "\"syncs\":" + String(scales[i].drift.successful_syncs) + ",";
+      json += "\"days_wo_sync\":" + String(scales[i].drift.days_without_sync) + ",";
+      json += "\"min\":" + String(scales[i].drift.min_drift_seen) + ",";
+      json += "\"max\":" + String(scales[i].drift.max_drift_seen);
+      json += "}";
+    }
+    
     json += "}";
   }
   json += "]}";
@@ -321,28 +459,55 @@ bool sendWithRetry(String payload) {
     if (!gsmClient.connect(SERVER, PORT)) {
       Serial.println("❌ Brak połączenia z serwerem");
     } else {
-      gsmClient.println("POST " + String(PATH) + " HTTP/1.1");
+      gsmClient.println("POST " + String(PATH) + " HTTP/1.0");
       gsmClient.println("Host: " + String(SERVER));
       gsmClient.println("Content-Type: application/json");
+      gsmClient.println("Connection: close");
       gsmClient.print("Content-Length: ");
       gsmClient.println(payload.length());
       gsmClient.println();
       gsmClient.print(payload);
+      gsmClient.flush();
 
       unsigned long t = millis();
-      while (gsmClient.connected() && !gsmClient.available()) {
-        if (millis() - t > 5000) break;
-      }
+while (gsmClient.connected() && !gsmClient.available()) {
+  if (millis() - t > 15000) {
+    Serial.println("⏱ Timeout oczekiwania na odpowiedź");
+    break;
+  }
+  delay(100);
+}
 
-      String response = gsmClient.readString();
-      gsmClient.stop();
+String statusLine = "";
+String response = "";
+bool firstLine = true;
 
-      if (response.indexOf("200 OK") >= 0) {
-        Serial.println("✅ Dane wysłane poprawnie");
-        return true;
-      }
+unsigned long readStart = millis();
+while (gsmClient.available() ||
+       (gsmClient.connected() && millis() - readStart < 5000)) {
+  if (gsmClient.available()) {
+    String line = gsmClient.readStringUntil('\n');
+    if (firstLine) {
+      statusLine = line;
+      firstLine = false;
+      Serial.print("📨 Status HTTP: ");
+      Serial.println(statusLine);
+    }
+    response += line;
+  }
+}
 
-      Serial.println("⚠️ Zła odpowiedź serwera");
+gsmClient.stop();
+
+if (statusLine.indexOf("200") >= 0) {
+  Serial.println("✅ Dane wysłane poprawnie");
+  return true;
+}
+
+Serial.print("⚠️ Zła odpowiedź: ");
+Serial.println(statusLine);
+Serial.println("Pełna odpowiedź serwera:");
+Serial.println(response);
     }
 
     if (attempt < GPRS_MAX_RETRIES) {
@@ -368,6 +533,15 @@ void setup() {
   Serial.println("                ║");
   Serial.println("╚════════════════════════════════╝");
   
+  // Miganie diody LED 3 razy
+  pinMode(LED_PIN, OUTPUT);
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(500);
+    digitalWrite(LED_PIN, LOW);
+    delay(500);
+  }
+
   DateTime now = rtc.now();
   Serial.print("📅 Czas: ");
   Serial.print(nowStr());

@@ -4,9 +4,10 @@
 #include "HX711.h"
 #include <sys/time.h>
 #include <time.h>
+#include "soc/rtc.h"
 
 // ================== WERSJA FIRMWARE ==================
-#define FIRMWARE_VERSION "1.1"
+#define FIRMWARE_VERSION "1.2-DRIFT"
 
 // ================== PINY HX711 ==================
 #define HX711_DT_PIN    5
@@ -31,9 +32,33 @@ const int WAKEUP_HOURS[] = {6, 20};    // Godziny wybudzenia: 6:00 i 20:00
 const int WAKEUP_MINUTES[] = {0, 0};   // Minuty wybudzenia
 const int WAKEUP_COUNT = 2;
 
+// ================== STRUKTURA DRYFU RTC ==================
+struct rtc_drift_data {
+    int32_t drift_ppm_avg;           // Uśredniony dryf w ppm
+    int32_t drift_ppm_last;          // Ostatni zmierzony dryf
+    uint32_t last_sync_timestamp;    // Timestamp ostatniej synchronizacji
+    uint64_t last_sync_rtc_ticks;    // RTC ticki przy synchronizacji
+    uint32_t successful_syncs;       // Licznik udanych synchronizacji
+    uint32_t days_without_sync;      // Dni bez synchronizacji
+    int32_t max_drift_seen;          // Maksymalny zaobserwowany dryf
+    int32_t min_drift_seen;          // Minimalny zaobserwowany dryf
+    bool drift_initialized;          // Czy system dryfu jest zainicjowany
+};
+
 // ================== RTC DATA (zachowane w deep sleep) ==================
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR bool rtcInitialized = false;
+RTC_DATA_ATTR rtc_drift_data driftData = {
+    .drift_ppm_avg = 0,
+    .drift_ppm_last = 0,
+    .last_sync_timestamp = 0,
+    .last_sync_rtc_ticks = 0,
+    .successful_syncs = 0,
+    .days_without_sync = 0,
+    .max_drift_seen = -999999,
+    .min_drift_seen = 999999,
+    .drift_initialized = false
+};
 
 // ================== ZMIENNE ROBOCZE ==================
 bool timeReceived = false;
@@ -81,6 +106,189 @@ void getCurrentTimeComponents(int &hour, int &minute, int &second) {
   } else {
     hour = minute = second = 0;
   }
+}
+
+// ================== FUNKCJE DRYFU RTC ==================
+
+// Pobierz aktualne ticki RTC
+uint64_t getRtcTicks() {
+    return rtc_time_get();
+}
+
+// Pobierz częstotliwość RTC (Hz) - dla ESP32 to zazwyczaj ~150kHz
+uint32_t getRtcFrequency() {
+    return rtc_clk_slow_freq_get_hz();
+}
+
+// Zapisz punkt synchronizacji (wieczór)
+void recordSyncPoint(uint32_t timestamp) {
+    // Poczekaj chwilę na stabilizację po wybudzeniu
+    delay(100);
+    
+    driftData.last_sync_timestamp = timestamp;
+    driftData.last_sync_rtc_ticks = getRtcTicks();
+    driftData.days_without_sync = 0;
+    
+    Serial.println("\n📍 PUNKT SYNCHRONIZACJI:");
+    Serial.print("   Timestamp: ");
+    Serial.println(timestamp);
+    Serial.print("   RTC ticks: ");
+    Serial.println((unsigned long)driftData.last_sync_rtc_ticks);
+    Serial.print("   RTC freq: ");
+    Serial.print(getRtcFrequency());
+    Serial.println(" Hz");
+}
+
+// Oblicz i zaktualizuj dryf (poranek)
+void calculateAndUpdateDrift(uint32_t current_timestamp) {
+    if (!driftData.drift_initialized || driftData.last_sync_timestamp == 0) {
+        Serial.println("⚠️ Brak punktu odniesienia - pomijam obliczanie dryfu");
+        return;
+    }
+    
+    // Poczekaj chwilę na stabilizację po wybudzeniu
+    delay(100);
+    
+    uint64_t current_rtc_ticks = getRtcTicks();
+    uint32_t rtc_freq = getRtcFrequency();
+    
+    // Rzeczywisty upływ czasu według centrali
+    int32_t delta_real = current_timestamp - driftData.last_sync_timestamp;
+    
+    // Upływ czasu według RTC
+    uint64_t delta_ticks = current_rtc_ticks - driftData.last_sync_rtc_ticks;
+    float delta_rtc = (float)delta_ticks / (float)rtc_freq;
+    
+    // Oblicz dryf
+    float drift = delta_rtc - (float)delta_real;
+    int32_t drift_ppm = (int32_t)((drift / (float)delta_real) * 1000000.0);
+    
+    Serial.println("\n📊 ANALIZA DRYFU:");
+    Serial.print("   Czas rzeczywisty: ");
+    Serial.print(delta_real);
+    Serial.println(" s");
+    Serial.print("   Czas RTC: ");
+    Serial.print(delta_rtc, 2);
+    Serial.println(" s");
+    Serial.print("   Różnica: ");
+    Serial.print(drift, 2);
+    Serial.println(" s");
+    Serial.print("   Dryf: ");
+    Serial.print(drift_ppm);
+    Serial.println(" ppm");
+    
+    // Zabezpieczenie - clamp dryfu
+    if (drift_ppm > 5000) {
+        Serial.println("⚠️ Dryf > 5000 ppm - ograniczam do 5000");
+        drift_ppm = 5000;
+    }
+    if (drift_ppm < -5000) {
+        Serial.println("⚠️ Dryf < -5000 ppm - ograniczam do -5000");
+        drift_ppm = -5000;
+    }
+    
+    driftData.drift_ppm_last = drift_ppm;
+    
+    // Watchdog - jeśli dryf drastycznie się zmienił, zrób hard reset EMA
+    if (driftData.successful_syncs > 3) {
+        int32_t drift_delta = abs(drift_ppm - driftData.drift_ppm_avg);
+        if (drift_delta > 2000) {
+            Serial.println("⚠️ Drastyczna zmiana dryfu - hard reset EMA!");
+            driftData.drift_ppm_avg = drift_ppm;
+            driftData.successful_syncs = 1; // Reset licznika
+        } else {
+            // Normalna aktualizacja EMA
+            // Cold start - szybsze uczenie
+            float alpha = (driftData.successful_syncs < 10) ? 0.4 : 0.2;
+            driftData.drift_ppm_avg = (int32_t)(
+                driftData.drift_ppm_avg * (1.0 - alpha) + 
+                drift_ppm * alpha
+            );
+        }
+    } else {
+        // Pierwsze pomiary - po prostu zapisz
+        driftData.drift_ppm_avg = drift_ppm;
+    }
+    
+    // Aktualizuj statystyki
+    if (drift_ppm > driftData.max_drift_seen) {
+        driftData.max_drift_seen = drift_ppm;
+    }
+    if (drift_ppm < driftData.min_drift_seen) {
+        driftData.min_drift_seen = drift_ppm;
+    }
+    
+    driftData.successful_syncs++;
+    driftData.drift_initialized = true;
+    
+    Serial.println("\n✅ AKTUALIZACJA DRYFU:");
+    Serial.print("   Drift avg: ");
+    Serial.print(driftData.drift_ppm_avg);
+    Serial.println(" ppm");
+    Serial.print("   Sync count: ");
+    Serial.println(driftData.successful_syncs);
+    Serial.print("   Min/Max: ");
+    Serial.print(driftData.min_drift_seen);
+    Serial.print(" / ");
+    Serial.print(driftData.max_drift_seen);
+    Serial.println(" ppm");
+}
+
+// Oblicz skorygowany czas snu
+long calculateCorrectedSleepTime(long planned_sleep_seconds) {
+    if (!driftData.drift_initialized || driftData.successful_syncs < 2) {
+        Serial.println("⚠️ Dryf nie zainicjowany - brak korekcji");
+        return planned_sleep_seconds;
+    }
+    
+    // Jeśli dawno nie było sync, nie koryguj (dryf nieprzewidywalny)
+    if (driftData.days_without_sync > 2) {
+        Serial.println("⚠️ Brak sync > 2 dni - brak korekcji");
+        return planned_sleep_seconds;
+    }
+    
+    // Oblicz korekcję
+    float correction = (float)planned_sleep_seconds * (float)driftData.drift_ppm_avg / 1000000.0;
+    long corrected_sleep = planned_sleep_seconds - (long)correction;
+    
+    Serial.println("\n🎯 KOREKCJA CZASU SNU:");
+    Serial.print("   Planowany: ");
+    Serial.print(planned_sleep_seconds);
+    Serial.println(" s");
+    Serial.print("   Korekcja: ");
+    Serial.print(correction, 2);
+    Serial.println(" s");
+    Serial.print("   Skorygowany: ");
+    Serial.print(corrected_sleep);
+    Serial.println(" s");
+    
+    // Zabezpieczenie - maksymalna korekcja ±5%
+    long max_correction = planned_sleep_seconds / 20; // 5%
+    if (abs(corrected_sleep - planned_sleep_seconds) > max_correction) {
+        Serial.println("⚠️ Korekcja > 5% - ograniczam");
+        if (corrected_sleep > planned_sleep_seconds) {
+            corrected_sleep = planned_sleep_seconds + max_correction;
+        } else {
+            corrected_sleep = planned_sleep_seconds - max_correction;
+        }
+    }
+    
+    return corrected_sleep;
+}
+
+// Generuj raport dryfu do wysłania
+String getDriftReport() {
+    char buffer[150];
+    snprintf(buffer, sizeof(buffer), 
+        "D:%d;%d;%d;%d;%d;%d",
+        driftData.drift_ppm_avg,
+        driftData.drift_ppm_last,
+        driftData.successful_syncs,
+        driftData.days_without_sync,
+        driftData.min_drift_seen,
+        driftData.max_drift_seen
+    );
+    return String(buffer);
 }
 
 // Oblicz ile sekund do następnego wybudzenia
@@ -163,7 +371,6 @@ class MyCharCallbacks: public BLECharacteristicCallbacks {
     }
     
     void onWrite(BLECharacteristic *pCharacteristic) {
-        // POPRAWKA: użyj std::string zamiast String przez c_str()
         std::string stdValue = pCharacteristic->getValue();
         String value = String(stdValue.c_str());
         
@@ -171,22 +378,37 @@ class MyCharCallbacks: public BLECharacteristicCallbacks {
             Serial.print("📥 Otrzymano: ");
             Serial.println(value);
             
-    // Format: "TIME:2026-02-08 18:30:15"
-    if (value.startsWith("TIME:")) {
-    String timestampStr = value.substring(5);
-    uint32_t timestamp = timestampStr.toInt();
-    
-    // POPRAWKA: jawne rzutowanie typu
-    time_t t = (time_t)timestamp;
-    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    
-    rtcInitialized = true;
-    timeReceived = true;
-    
-    Serial.print("✅ Czas ustawiony: ");
-    Serial.println(getCurrentTime());
-}
+            // Format: "TIME:1234567890"
+            if (value.startsWith("TIME:")) {
+                String timestampStr = value.substring(5);
+                uint32_t timestamp = timestampStr.toInt();
+                
+                // Ustaw czas systemowy
+                time_t t = (time_t)timestamp;
+                struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                
+                rtcInitialized = true;
+                timeReceived = true;
+                
+                Serial.print("✅ Czas ustawiony: ");
+                Serial.println(getCurrentTime());
+                
+                // Określ czy to poranek czy wieczór
+                struct tm timeinfo;
+                getLocalTime(&timeinfo);
+                int hour = timeinfo.tm_hour;
+                
+                if (hour >= 5 && hour < 12) {
+                    // PORANEK - oblicz dryf
+                    Serial.println("\n🌅 SYNCHRONIZACJA PORANNA");
+                    calculateAndUpdateDrift(timestamp);
+                } else {
+                    // WIECZÓR - zapisz punkt synchronizacji
+                    Serial.println("\n🌆 SYNCHRONIZACJA WIECZORNA");
+                    recordSyncPoint(timestamp);
+                }
+            }
         }
     }
 };
@@ -271,10 +493,15 @@ void setup() {
     Serial.println("║    🐝 WAGA PASIECZNA          ║");
     Serial.print("║    Firmware: ");
     Serial.print(FIRMWARE_VERSION);
-    Serial.println("             ║");
+    Serial.println("        ║");
     Serial.println("╚════════════════════════════════╝");
     Serial.print("Boot #");
     Serial.println(bootCount);
+    
+    // Inkrementuj licznik dni bez sync
+    if (rtcInitialized) {
+        driftData.days_without_sync++;
+    }
     
     // Konfiguruj strefy czasowe (UTC+1 dla Polski)
     setenv("TZ", "UTC0", 1);
@@ -283,6 +510,21 @@ void setup() {
     if (rtcInitialized) {
         Serial.print("⏰ Czas: ");
         Serial.println(getCurrentTime());
+        
+        // Pokaż status dryfu
+        if (driftData.drift_initialized) {
+            Serial.println("\n📊 STATUS DRYFU RTC:");
+            Serial.print("   Drift avg: ");
+            Serial.print(driftData.drift_ppm_avg);
+            Serial.println(" ppm");
+            Serial.print("   Last drift: ");
+            Serial.print(driftData.drift_ppm_last);
+            Serial.println(" ppm");
+            Serial.print("   Syncs: ");
+            Serial.println(driftData.successful_syncs);
+            Serial.print("   Days w/o sync: ");
+            Serial.println(driftData.days_without_sync);
+        }
     } else {
         Serial.println("⚠️ RTC nie zainicjalizowany - czekam na synchronizację");
     }
@@ -307,7 +549,8 @@ void setup() {
     napiecie = readBatteryVoltage();
 
     // === PRZYGOTOWANIE DANYCH ===
-    String daneDoWyslania = String(masa, 2) + ";" + String(napiecie, 2);
+    // Format: "masa;napiecie;drift_report"
+    String daneDoWyslania = String(masa, 2) + ";" + String(napiecie, 2) + ";" + getDriftReport();
     Serial.print("\n📦 Dane BLE: ");
     Serial.println(daneDoWyslania);
 
@@ -375,7 +618,8 @@ void setup() {
     long sleepSeconds;
     
     if (rtcInitialized) {
-        sleepSeconds = calculateSecondsToNextWakeup();
+        long planned_sleep = calculateSecondsToNextWakeup();
+        sleepSeconds = calculateCorrectedSleepTime(planned_sleep);
     } else {
         // Bez synchronizacji czasu - wybudź za 1h
         sleepSeconds = 3600;
@@ -389,6 +633,19 @@ void setup() {
     Serial.print("\n💤 Deep sleep przez ");
     Serial.print(sleepSeconds);
     Serial.println(" sekund");
+    
+    // Pokaż przewidywany czas wybudzenia
+    if (rtcInitialized) {
+        time_t now;
+        time(&now);
+        time_t wake = now + sleepSeconds;
+        struct tm* wake_time = localtime(&wake);
+        char wake_buffer[20];
+        strftime(wake_buffer, sizeof(wake_buffer), "%Y-%m-%d %H:%M:%S", wake_time);
+        Serial.print("⏰ Przewidywane wybudzenie: ");
+        Serial.println(wake_buffer);
+    }
+    
     Serial.println("═══════════════════════════════════\n");
     
     delay(1000);
