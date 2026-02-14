@@ -263,14 +263,24 @@ void rtc_init() {
 
 // ================== BATERIA CENTRALI ==================
 float readCentralBattery() {
-    analogReadResolution(12);
+
     analogSetPinAttenuation(CENTRAL_BAT_ADC_PIN, ADC_11db);
-    uint32_t sum = 0;
-    for (int i = 0; i < 16; i++) { sum += analogRead(CENTRAL_BAT_ADC_PIN); delayMicroseconds(100); }
-    float voltage = (sum / 16.0 / 4095.0) * 3.3 * 2.0;
-    logf("🔋 Bateria centrali: %.2f V", voltage);
+    analogReadResolution(12);    
+
+    float raw = analogRead(CENTRAL_BAT_ADC_PIN);
+
+    // 11dB → ~3.6V zakres
+    float v_adc = raw / 4095.0 * 3.6;
+
+    // jeśli masz pewność że dzielnik 1:2
+    float voltage = v_adc * 1.8;
+
+    Serial.printf("RAW: %.0f  ADC: %.3fV  BAT: %.3fV\n",
+                  raw, v_adc, voltage);
+
     return voltage;
 }
+
 
 // ================== MAC HANDLING ==================
 bool alreadyHandled(BLEAddress addr) {
