@@ -1,0 +1,25 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Waga Upload + Monitor",
+      "type": "shell",
+      "command": "pio run -e waga -t upload && pio device monitor -e waga",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "Centrala Upload + Monitor",
+      "type": "shell",
+      "command": "pio run -e centrala -t upload && pio device monitor -e centrala",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    }
+  ]
+}
