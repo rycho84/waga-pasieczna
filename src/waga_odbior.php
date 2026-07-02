@@ -1,4 +1,5 @@
 <?php
+// Zmiana: usunieto nieuzywana obsluge telemetrii dryfu z raportow wag.
 header('Content-Type: application/json; charset=utf-8');
 
 $host    = 'localhost';
@@ -88,58 +89,6 @@ $stmt->execute([
             ':measured_at' => $timestamp
         ]);
 
-        // Zapis dryfu do tabeli device_drift_stats
-        if (isset($measurement['drift']) && is_array($measurement['drift'])) {
-            $drift = $measurement['drift'];
-            $syncs = intval($drift['syncs'] ?? 0);
-
-            if ($syncs > 0) {
-                $drift_avg  = intval($drift['avg']             ?? 0);
-                $drift_last = intval($drift['last']            ?? 0);
-                $days_wo    = intval($drift['boots_since_eve'] ?? 0);
-                $min_drift  = intval($drift['min']             ?? 0);
-                $max_drift  = intval($drift['max']             ?? 0);
-
-                $stmt = $pdo->prepare("
-                    INSERT INTO device_drift_stats (
-                        device_id, drift_ppm_avg, drift_ppm_last,
-                        successful_syncs, days_without_sync,
-                        min_drift_seen, max_drift_seen
-                    )
-                    VALUES (
-                        :device_id, :drift_avg, :drift_last,
-                        :syncs, :days_wo,
-                        :min_drift, :max_drift
-                    )
-                    ON DUPLICATE KEY UPDATE
-    drift_ppm_avg     = VALUES(drift_ppm_avg),
-    drift_ppm_last    = VALUES(drift_ppm_last),
-    successful_syncs  = VALUES(successful_syncs),
-    days_without_sync = VALUES(days_without_sync),
-    min_drift_seen    = VALUES(min_drift_seen),
-    max_drift_seen    = VALUES(max_drift_seen)
-                ");
-                $stmt->execute([
-                    ':device_id' => $device_id,
-                    ':drift_avg' => $drift_avg,
-                    ':drift_last'=> $drift_last,
-                    ':syncs'     => $syncs,
-                    ':days_wo'   => $days_wo,
-                    ':min_drift' => $min_drift,
-                    ':max_drift' => $max_drift,
-                ]);
-
-                // Zaktualizuj drift_quality w tabeli devices
-                $abs_avg = abs($drift_avg);
-                if      ($abs_avg < 500)  $quality = 'excellent';
-                elseif  ($abs_avg < 1000) $quality = 'good';
-                elseif  ($abs_avg < 2000) $quality = 'fair';
-                else                      $quality = 'poor';
-
-                $pdo->prepare("UPDATE devices SET drift_quality = :q WHERE id = :id")
-                    ->execute([':q' => $quality, ':id' => $device_id]);
-            }
-        }
     }
 
     $pdo->commit();

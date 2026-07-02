@@ -1,46 +1,61 @@
+// Zmiana: 5.3 - usunieto telemetrie dryfu, odblokowano cykliczna synchronizacje DS3231 i ograniczono retry poza oknem centrali.
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <Preferences.h>
 #include "HX711.h"
-#include <time.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <sys/time.h>
+#include "driver/rtc_io.h"
+#include "driver/gpio.h"
 
 // ================== WERSJA ==================
-#define FIRMWARE_VERSION "2.2-DISCOVERY"
-
+#define FIRMWARE_VERSION "5.3-RESET-IRQ"
 
 // ================== PINY HX711 ==================
-#define HX711_DT_PIN    20
-#define HX711_SCK_PIN   21
-#define HX711_VCC_PIN   22
-#define HX711_GND_PIN   19
+#define HX711_DT_PIN    2
+#define HX711_SCK_PIN   3
+#define HX711_VCC_PIN   4
+#define HX711_GND_PIN   5
 
-// ================== KALIBRACJA ==================
-const float zero   = -271000;
-const float faktor = -23000;
+// ================== PINY DS3231 ==================
+// INT/SQW NIE jest podłączony – budzenie wyłącznie przez timer ESP
+#define DS3231_SDA_PIN  19
+#define DS3231_SCL_PIN  20
+#define DS3231_VCC_PIN  5   // zasilanie DS3231 sterowane z GPIO
+
+// ================== PIN RESET CENTRALI ==================
+#define RESET_BTN_PIN   6
+#define RESET_HOLD_MS   3000
+#define LED_PIN         7
+#define ONBOARD_LED_PIN 15
+
+// ================== KALIBRACJA WAGI ==================
+const float zero   = 1154100;
+const float faktor = -21600;
 
 // ================== BATERIA ==================
 #define BAT_ADC_PIN     0
 
-// ================== RESET KONFIGURACJI ==================
-#ifdef BOARD_ESP32_CLASSIC
-#define RESET_BTN_PIN   0    // GPIO0 = BOOT na klasycznym ESP32 / Wemos
-#else
-#define RESET_BTN_PIN   9    // GPIO9 = BOOT na FireBeetle ESP32-C6
-#endif
-#define RESET_HOLD_MS   3000
+// ================== HARMONOGRAM ==================
+#define PRESYNC_HOUR_1   5
+#define PRESYNC_MIN_1   30
+#define PRESYNC_HOUR_2  19
+#define PRESYNC_MIN_2   30
+#define SEND_HOUR_1      6
+#define SEND_HOUR_2     20
 
-// ================== ALARMY ==================
-#define ALARM_HOUR_1        6
-#define ALARM_HOUR_2        20
-#define MIN_SLEEP_SEC       1800UL  // min 30 min do alarmu – zapobiega podwójnemu wysłaniu
-#define DEFAULT_SLEEP_SEC   3600UL
+// ================== ESP-NOW ==================
+#define SEND_WINDOW_SEC      20
+#define RETRY_SLEEP_SEC      30
+#define RETRY_MAX_CYCLES_IN_WINDOW 3
+#define RETRY_SLEEP_LONG_SEC 1800UL
+#define RETRY_MAX_CYCLES     10
+#define DEFAULT_SLEEP_SEC    3600UL
+#define DISCOVERY_TIMEOUT_MS 5000
+#define DISCOVERY_RETRIES    12
 
-// ================== DISCOVERY ==================
-#define DISCOVERY_TIMEOUT_MS  5000
-#define DISCOVERY_RETRIES     5
-
-// Magiczne bajty
 #define MAGIC_DATA_WAGI     0x11
 #define MAGIC_DISCOVERY     0xBB
 #define MAGIC_DISC_RESPONSE 0xCC
@@ -48,19 +63,16 @@ const float faktor = -23000;
 
 uint8_t broadcastMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// ================== STRUKTURY ==================
+// ================== TRYBY WYBUDZENIA ==================
+#define WAKEUP_SEND    0
+#define WAKEUP_PRESYNC 1
+
+// ================== STRUKTURY ESP-NOW ==================
 typedef struct {
     uint8_t  magic;
     float    waga;
     float    bateria;
     char     device_id[20];
-    // ── Dane dryfu RTC ──────────────────────────────────
-    int32_t  drift_ppm_avg;
-    int32_t  drift_ppm_last;
-    uint32_t drift_syncs;
-    uint32_t drift_boots_since_eve;
-    int32_t  drift_min;
-    int32_t  drift_max;
 } DaneWagi;
 
 typedef struct {
@@ -74,51 +86,24 @@ typedef struct {
 } DiscoveryResponse;
 
 typedef struct {
-    uint8_t  magic;      // MAGIC_TIME_SYNC — musi być PIERWSZY bajt!
+    uint8_t  magic;
     uint32_t epoch;
 } TimeSyncPacket;
 
-// ================== PAMIĘĆ RTC ==================
-RTC_DATA_ATTR static time_t   savedEpoch        = 0;
-RTC_DATA_ATTR static bool     timeValid         = false;
+// ================== PAMIĘĆ RTC (przeżywa deep sleep) ==================
 RTC_DATA_ATTR static uint32_t bootCount         = 0;
 RTC_DATA_ATTR static uint8_t  rtcCentralaMAC[6] = {0};
 RTC_DATA_ATTR static bool     rtcMACValid       = false;
-
-// ── Dane dryfu RTC ────────────────────────────────────────
-struct RtcDriftData {
-    int32_t  drift_ppm_avg;
-    int32_t  drift_ppm_last;
-    uint32_t successful_syncs;
-    uint32_t boots_since_evening;
-    int32_t  max_drift_seen;
-    int32_t  min_drift_seen;
-    bool     drift_initialized;
-    bool     evening_recorded;
-    uint32_t sync_evening_ts;     // UNIX ts wieczornej sync
-    uint32_t sleep_started_ts;    // kiedy zasnął
-    uint32_t planned_wakeup_ts;   // kiedy planował wstać
-};
-RTC_DATA_ATTR static RtcDriftData drift = {
-    0, 0, 0, 0, -999999, 999999, false, false, 0, 0, 0
-};
-
-// ── Tryb retry (deep sleep między próbami wysyłki) ────────
-// 6 cykli × (10s aktywny + 20s sleep) = 3 minuty
-#define SEND_WINDOW_SEC   20   // czas aktywnego wysyłania [s]
-#define RETRY_SLEEP_SEC   30   // deep sleep między próbami [s]
-#define RETRY_MAX_CYCLES  10   // max liczba prób
-
-RTC_DATA_ATTR static uint8_t retryCycle = 0;  // licznik nieudanych prób
-RTC_DATA_ATTR static float   rtcWaga       = 0.0;   // zapamiętany pomiar wagi
-RTC_DATA_ATTR static float   rtcBateria    = 0.0;   // zapamiętane napięcie baterii
-RTC_DATA_ATTR static char    rtcDeviceId[20] = {0}; // zapamiętany device_id
+RTC_DATA_ATTR static uint8_t  wakeupMode        = WAKEUP_SEND;
+RTC_DATA_ATTR static uint8_t  retryCycle        = 0;
+RTC_DATA_ATTR static float    rtcWaga           = 0.0;
+RTC_DATA_ATTR static float    rtcBateria        = 0.0;
+RTC_DATA_ATTR static bool     ds3231Synced      = false;
 
 // ================== ZMIENNE GLOBALNE ==================
+char     wagaMAC[20]           = "";
 uint8_t  centralaMACbuf[6];
-bool     macKnown          = false;
-
-char         wagaMAC[20]        = "";   // wypełniany w setup() po WiFi.mode()
+bool     macKnown              = false;
 volatile bool wyslanoPomyslnie = false;
 volatile bool discoveryDone    = false;
 volatile bool timeSyncReceived = false;
@@ -128,90 +113,38 @@ TimeSyncPacket    receivedTimeSync;
 
 Preferences prefs;
 HX711       scale;
+RTC_DS3231  rtc;
 
-// ============================================================
-// ================== LOGIKA DRYFU ==================
-// ============================================================
+// ================== RESET BUTTON ISR ==================
+volatile unsigned long resetPressedAt = 0;
+volatile bool resetBtnHeld = false;
+volatile bool resetInProgress = false;
+TaskHandle_t resetTaskHandle = nullptr;
 
-// Wieczór: zapisz punkt odniesienia
-void recordEveningSyncPoint(uint32_t unix_ts) {
-    drift.sync_evening_ts     = unix_ts;
-    drift.boots_since_evening = 0;
-    drift.evening_recorded    = true;
-    Serial.printf("🌆 Punkt wieczorny zapisany: %u\n", unix_ts);
+bool isResetButtonPressed() {
+    return digitalRead(RESET_BTN_PIN) == LOW;
 }
 
-// Poranek: oblicz dryf na podstawie UNIX timestampów
-void calculateDrift(uint32_t morning_unix_ts) {
-    if (!drift.evening_recorded || drift.sync_evening_ts == 0) {
-        Serial.println("⚠️ Brak punktu wieczornego – pomijam drift");
-        return;
+void IRAM_ATTR onResetBtn() {
+    BaseType_t higherPriorityTaskWoken = pdFALSE;
+    if (resetTaskHandle != nullptr) {
+        vTaskNotifyGiveFromISR(resetTaskHandle, &higherPriorityTaskWoken);
+        portYIELD_FROM_ISR(higherPriorityTaskWoken);
     }
-    int32_t delta_real = (int32_t)(morning_unix_ts - drift.sync_evening_ts);
-    if (delta_real < 3600 || delta_real > 50000) {
-        Serial.printf("⚠️ Podejrzany delta_real=%d s – pomijam\n", delta_real);
-        return;
-    }
-    if (drift.sleep_started_ts == 0 || drift.planned_wakeup_ts == 0) {
-        Serial.println("⚠️ Brak danych sleep ts – pomijam drift");
-        return;
-    }
-    int32_t delta_esp = (int32_t)(drift.planned_wakeup_ts - drift.sleep_started_ts);
-    if (delta_esp < 60) return;
-
-    float   drift_sec = (float)delta_esp - (float)delta_real;
-    int32_t drift_ppm = (int32_t)((drift_sec / (float)delta_real) * 1000000.0f);
-    drift_ppm = constrain(drift_ppm, -10000L, 10000L);
-
-    Serial.printf("📊 Drift: real=%ds esp=%ds diff=%.1fs ppm=%d\n",
-                  delta_real, delta_esp, drift_sec, drift_ppm);
-
-    drift.drift_ppm_last = drift_ppm;
-
-    if (!drift.drift_initialized || drift.successful_syncs == 0) {
-        drift.drift_ppm_avg = drift_ppm;
-    } else {
-        if (abs(drift_ppm - drift.drift_ppm_avg) > 3000) {
-            Serial.println("⚠️ Drastyczna zmiana dryfu – reset EMA");
-            drift.drift_ppm_avg = drift_ppm;
-        } else {
-            float alpha = (drift.successful_syncs < 5) ? 0.5f : 0.25f;
-            drift.drift_ppm_avg = (int32_t)(drift.drift_ppm_avg * (1.0f - alpha) + drift_ppm * alpha);
-        }
-    }
-
-    if (drift_ppm > drift.max_drift_seen) drift.max_drift_seen = drift_ppm;
-    if (drift_ppm < drift.min_drift_seen) drift.min_drift_seen = drift_ppm;
-
-    drift.successful_syncs++;
-    drift.drift_initialized = true;
-    drift.evening_recorded  = false;
-
-    Serial.printf("✅ Drift avg=%d ppm  syncs=%u\n",
-                  drift.drift_ppm_avg, drift.successful_syncs);
-}
-
-// Skoryguj czas snu o zmierzony dryf
-long applyDriftCorrection(long planned_sec) {
-    if (!drift.drift_initialized || drift.successful_syncs < 1) return planned_sec;
-    if (drift.boots_since_evening > 6) return planned_sec;
-
-    float correction = (float)planned_sec * (float)drift.drift_ppm_avg / 1000000.0f;
-    long  max_corr   = planned_sec / 10;
-    long  corrected  = constrain((long)(planned_sec - correction),
-                                  planned_sec - max_corr,
-                                  planned_sec + max_corr);
-    Serial.printf("🎯 Korekcja snu: %ld→%ld s (%.1fs, drift=%d ppm)\n",
-                  planned_sec, corrected, correction, drift.drift_ppm_avg);
-    return corrected;
 }
 
 // ================== FORWARD DECLARATIONS ==================
-void goToSleep();
+void handlePresyncWakeup();
+void handleSendWakeup();
+void goSleepFallback();
+void sleepUntilTime(time_t now, uint8_t targetHour, uint8_t targetMin, uint8_t nextMode);
+void sleepTimer(uint32_t sec, uint8_t nextMode);
+bool handleResetHoldAtBoot(const char* source);
 
 // ============================================================
-// ================== CZAS ==================
+// ================== HELPERS =================================
 // ============================================================
+
 String epochToString(time_t t) {
     struct tm tm_info;
     localtime_r(&t, &tm_info);
@@ -220,23 +153,275 @@ String epochToString(time_t t) {
     return String(buf);
 }
 
-uint64_t secondsUntilNextAlarm(time_t now) {
+uint32_t secondsUntil(time_t now, uint8_t targetHour, uint8_t targetMin) {
     struct tm t;
     localtime_r(&now, &t);
-    int currentSecs = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
-    const int targets[] = { ALARM_HOUR_1 * 3600, ALARM_HOUR_2 * 3600 };
-    int minDiff = 86400;
-    for (int i = 0; i < 2; i++) {
-        int diff = targets[i] - currentSecs;
-        if (diff <= (int)MIN_SLEEP_SEC) diff += 86400;
-        if (diff < minDiff) minDiff = diff;
+    struct tm target  = t;
+    target.tm_hour    = targetHour;
+    target.tm_min     = targetMin;
+    target.tm_sec     = 0;
+    time_t targetTime = mktime(&target);
+    if (targetTime <= now + 60) targetTime += 86400;
+    return (uint32_t)(targetTime - now);
+}
+
+void setSystemTime(uint32_t epoch) {
+    struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    Serial.printf("Czas systemowy ustawiony: %s\n", epochToString((time_t)epoch).c_str());
+}
+
+
+// ============================================================
+// ================== RESET PRZYCISK ==========================
+// ============================================================
+
+void doReset() {
+    if (resetInProgress) return;
+    resetInProgress = true;
+
+    Serial.println(">>> RESET CENTRALI – czyszczę NVS i RTC RAM <<<");
+    prefs.begin("waga_cfg", false);
+    prefs.remove("c_mac");
+    prefs.end();
+    rtcMACValid      = false;
+    ds3231Synced     = false;
+    macKnown         = false;
+    wakeupMode       = WAKEUP_SEND;
+    retryCycle       = 0;
+    discoveryDone    = false;
+    timeSyncReceived = false;
+    wyslanoPomyslnie = false;
+    memset(rtcCentralaMAC, 0, sizeof(rtcCentralaMAC));
+    memset(centralaMACbuf, 0, sizeof(centralaMACbuf));
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    digitalWrite(LED_PIN, LOW);
+
+    while (isResetButtonPressed()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    return (uint64_t)minDiff;
+
+    ESP.restart();
+}
+
+void checkResetAnytime() {
+    if (!resetBtnHeld && isResetButtonPressed()) {
+        resetPressedAt = millis();
+        resetBtnHeld   = true;
+    }
+
+    if (resetBtnHeld && !isResetButtonPressed()) {
+        resetBtnHeld   = false;
+        resetPressedAt = 0;
+        return;
+    }
+
+    if (resetBtnHeld && resetPressedAt > 0 && millis() - resetPressedAt >= RESET_HOLD_MS) {
+        doReset();
+    }
+}
+
+bool handleResetHoldAtBoot(const char* source) {
+    if (!isResetButtonPressed()) return false;
+
+    Serial.printf("Reset GPIO aktywny (%s) - czekam %ums na dlugie przytrzymanie\n",
+                  source, RESET_HOLD_MS);
+
+    unsigned long startedAt = millis();
+    while (isResetButtonPressed()) {
+        if (millis() - startedAt >= RESET_HOLD_MS) {
+            Serial.println("Wykryto dlugie przytrzymanie resetu");
+            doReset();
+            return true;
+        }
+        delay(20);
+    }
+
+    Serial.println("Krotkie nacisniecie resetu - tylko wybudzenie");
+    return false;
+}
+
+void resetTask(void* pvParameters) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        checkResetAnytime();
+    }
 }
 
 // ============================================================
-// ================== PREFERENCES ==================
+// ================== DS3231 ==================================
 // ============================================================
+
+bool ds3231Init() {
+    pinMode(DS3231_VCC_PIN, OUTPUT);
+    digitalWrite(DS3231_VCC_PIN, HIGH);
+    delay(100);
+    Wire.begin(DS3231_SDA_PIN, DS3231_SCL_PIN);
+    if (!rtc.begin(&Wire)) {
+        Serial.println("DS3231: nie odpowiada!");
+        Wire.end();
+        digitalWrite(DS3231_VCC_PIN, LOW);
+        return false;
+    }
+    return true;
+}
+
+void ds3231Off() {
+    Wire.end();
+    digitalWrite(DS3231_VCC_PIN, LOW);
+    Serial.println("DS3231: zasilanie wyłączone");
+}
+
+time_t ds3231GetTime() {
+    if (!ds3231Init()) return 0;
+    if (rtc.lostPower()) {
+        Serial.println("DS3231: lostPower=true – czas niewiarygodny, wymuszam ponowna synchronizacje");
+        ds3231Synced = false;
+        ds3231Off();
+        return 0;
+    }
+    DateTime now = rtc.now();
+    ds3231Off();
+
+    if (now.year() < 2024) {
+        Serial.println("DS3231: czas sprzed 2024 – niezainicjalizowany");
+        return 0;
+    }
+    time_t t = now.unixtime();
+    Serial.printf("DS3231: %s\n", epochToString(t).c_str());
+    return t;
+}
+
+bool ds3231SetTime(uint32_t epoch) {
+    if (!ds3231Init()) return false;
+    rtc.adjust(DateTime(epoch));
+    ds3231Off();
+    Serial.printf("DS3231 ustawiony: %s\n", epochToString((time_t)epoch).c_str());
+    return true;
+}
+
+// ============================================================
+// ================== SLEEP ===================================
+// ============================================================
+
+void sleepTimer(uint32_t sec, uint8_t nextMode) {
+    wakeupMode = nextMode;
+    Serial.printf("Deep sleep %us (%.2fh) | nextMode: %s\n",
+                  sec, sec / 3600.0f,
+                  nextMode == WAKEUP_PRESYNC ? "PRESYNC" : "SEND");
+    delay(200);
+    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+
+    gpio_sleep_set_pull_mode((gpio_num_t)RESET_BTN_PIN, GPIO_PULLUP_ONLY);
+    gpio_deep_sleep_wakeup_enable((gpio_num_t)RESET_BTN_PIN, GPIO_INTR_LOW_LEVEL);
+    esp_err_t wakeErr = esp_deep_sleep_enable_gpio_wakeup(1ULL << RESET_BTN_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+    if (wakeErr != ESP_OK) {
+        Serial.printf("GPIO wakeup setup failed: %d\n", (int)wakeErr);
+    }
+
+    esp_deep_sleep_start();
+}
+
+void sleepUntilTime(time_t now, uint8_t targetHour, uint8_t targetMin, uint8_t nextMode) {
+    uint32_t sec = secondsUntil(now, targetHour, targetMin);
+    Serial.printf("Sleep %us (~%.2fh) do %02d:%02d\n",
+                  sec, sec / 3600.0f, targetHour, targetMin);
+    sleepTimer(sec, nextMode);
+}
+
+// ============================================================
+// ================== HARMONOGRAM ALARMÓW =====================
+// ============================================================
+
+void getNextPresyncAlarm(time_t now, uint8_t &hour, uint8_t &min) {
+    struct tm t;
+    localtime_r(&now, &t);
+    int curMin = t.tm_hour * 60 + t.tm_min;
+    int p1     = PRESYNC_HOUR_1 * 60 + PRESYNC_MIN_1;
+    int p2     = PRESYNC_HOUR_2 * 60 + PRESYNC_MIN_2;
+
+    if      (curMin + 5 < p1) { hour = PRESYNC_HOUR_1; min = PRESYNC_MIN_1; }
+    else if (curMin + 5 < p2) { hour = PRESYNC_HOUR_2; min = PRESYNC_MIN_2; }
+    else                      { hour = PRESYNC_HOUR_1; min = PRESYNC_MIN_1; }
+}
+
+void getSendTimeAfterPresync(time_t now, uint8_t &hour, uint8_t &min) {
+    struct tm t;
+    localtime_r(&now, &t);
+    hour = (t.tm_hour < 12) ? SEND_HOUR_1 : SEND_HOUR_2;
+    min  = 0;
+}
+
+void getNextScheduledWake(time_t now, uint8_t &hour, uint8_t &min, uint8_t &mode) {
+    struct tm t;
+    localtime_r(&now, &t);
+
+    struct Slot {
+        uint8_t hour;
+        uint8_t min;
+        uint8_t mode;
+    };
+
+    const Slot slots[] = {
+        { PRESYNC_HOUR_1, PRESYNC_MIN_1, WAKEUP_PRESYNC },
+        { SEND_HOUR_1,    0,             WAKEUP_SEND    },
+        { PRESYNC_HOUR_2, PRESYNC_MIN_2, WAKEUP_PRESYNC },
+        { SEND_HOUR_2,    0,             WAKEUP_SEND    }
+    };
+
+    time_t bestTime = 0;
+    const Slot* bestSlot = nullptr;
+
+    for (const Slot& slot : slots) {
+        struct tm candidate = t;
+        candidate.tm_hour = slot.hour;
+        candidate.tm_min  = slot.min;
+        candidate.tm_sec  = 0;
+
+        time_t candidateTime = mktime(&candidate);
+        if (candidateTime <= now + 60) {
+            candidateTime += 86400;
+        }
+
+        if (bestSlot == nullptr || candidateTime < bestTime) {
+            bestTime = candidateTime;
+            bestSlot = &slot;
+        }
+    }
+
+    hour = bestSlot->hour;
+    min  = bestSlot->min;
+    mode = bestSlot->mode;
+}
+
+// ============================================================
+// ================== FALLBACK SLEEP ==========================
+// ============================================================
+
+void goSleepFallback() {
+    if (ds3231Synced) {
+        time_t now = ds3231GetTime();
+        if (now > 0) {
+            setSystemTime((uint32_t)now);
+            uint8_t nextHour, nextMin, nextMode;
+            getNextScheduledWake(now, nextHour, nextMin, nextMode);
+            uint8_t pHour = nextHour, pMin = nextMin;
+            Serial.printf("Fallback: następny presync o %02d:%02d\n", pHour, pMin);
+            sleepUntilTime(now, nextHour, nextMin, nextMode);
+            return;
+        }
+    }
+    Serial.printf("Fallback: sleep %lus (1h), tryb SEND\n", DEFAULT_SLEEP_SEC);
+    sleepTimer(DEFAULT_SLEEP_SEC, WAKEUP_SEND);
+}
+
+// ============================================================
+// ================== PREFERENCES =============================
+// ============================================================
+
 bool loadCentralaMAC(uint8_t* mac) {
     prefs.begin("waga_cfg", true);
     bool ok = prefs.isKey("c_mac");
@@ -249,24 +434,14 @@ void saveCentralaMAC(const uint8_t* mac) {
     prefs.begin("waga_cfg", false);
     prefs.putBytes("c_mac", mac, 6);
     prefs.end();
-    Serial.printf("💾 Zapisano MAC centrali: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    Serial.printf("Zapisano MAC centrali: %02X:%02X:%02X:%02X:%02X:%02X\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-void clearConfig() {
-    prefs.begin("waga_cfg", false);
-    prefs.clear();
-    prefs.end();
-    rtcMACValid = false;
-    memset(rtcCentralaMAC, 0, 6);
-    Serial.println("🗑 Konfiguracja wyczyszczona – discovery przy następnym starcie");
-}
-
 // ============================================================
-// ================== ESP-NOW CALLBACKS ==================
+// ================== ESP-NOW CALLBACKS =======================
 // ============================================================
 
-// Wspólna logika odbioru – wywoływana z obu wersji callbacka
 void _handleRecv(const uint8_t *senderMAC, const uint8_t *data, int len) {
     if (len < 1) return;
     uint8_t magic = data[0];
@@ -275,67 +450,35 @@ void _handleRecv(const uint8_t *senderMAC, const uint8_t *data, int len) {
         memcpy(&receivedDiscResp, data, sizeof(DiscoveryResponse));
         memcpy(centralaMACbuf, senderMAC, 6);
         discoveryDone = true;
-        Serial.printf("📡 Discovery OK! Centrala: %s  MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      receivedDiscResp.gateway_id,
+        Serial.printf("Discovery OK! MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                       centralaMACbuf[0], centralaMACbuf[1], centralaMACbuf[2],
                       centralaMACbuf[3], centralaMACbuf[4], centralaMACbuf[5]);
     }
     else if (magic == MAGIC_TIME_SYNC && len == sizeof(TimeSyncPacket)) {
         memcpy(&receivedTimeSync, data, sizeof(TimeSyncPacket));
-        uint32_t unix_ts = receivedTimeSync.epoch;
-
-        // Walidacja timestamp
-        if (unix_ts < 1700000000UL) {
-            Serial.println("⚠️ Sync: timestamp za mały – odrzucam");
-            return;
-        }
-
-        timeSyncReceived = true;
-        Serial.printf("🕐 Sync czasu: %u (%s)\n",
-                      unix_ts, epochToString((time_t)unix_ts).c_str());
-
-        // Określ porę dnia i obsłuż drift
-        struct tm t;
-        time_t tt = (time_t)unix_ts;
-        localtime_r(&tt, &t);
-        int hour = t.tm_hour;
-
-        if (hour >= 5 && hour < 14) {
-            // Poranek – oblicz dryf
-            calculateDrift(unix_ts);
-        } else {
-            // Wieczór/noc – zapisz punkt odniesienia
-            recordEveningSyncPoint(unix_ts);
+        if (receivedTimeSync.epoch > 1700000000UL) {
+            timeSyncReceived = true;
+            Serial.printf("Sync czasu: %s\n",
+                          epochToString((time_t)receivedTimeSync.epoch).c_str());
         }
     }
 }
 
-#ifdef BOARD_ESP32_CLASSIC
-// ── Stary SDK: espressif32 <=6.x (ESP32, WEMOS itp.) ──────
-void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
-    wyslanoPomyslnie = (status == ESP_NOW_SEND_SUCCESS);
-    Serial.println(wyslanoPomyslnie ? "📤 ✅ Wysłano" : "📤 ❌ Błąd wysyłania");
-}
-void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
-    _handleRecv(mac, data, len);
-}
-#else
-// ── Nowy SDK: pioarduino (ESP32-C6, S3 itp.) ──────────────
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
     wyslanoPomyslnie = (status == ESP_NOW_SEND_SUCCESS);
-    Serial.println(wyslanoPomyslnie ? "📤 ✅ Wysłano" : "📤 ❌ Błąd wysyłania");
+    Serial.println(wyslanoPomyslnie ? "Wysłano OK" : "Błąd wysyłania");
 }
+
 void onDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     _handleRecv(recv_info->src_addr, data, len);
 }
-#endif
 
 // ============================================================
-// ================== DISCOVERY ==================
+// ================== DISCOVERY ===============================
 // ============================================================
+
 bool runDiscovery() {
-    Serial.println("\n🔍 Tryb DISCOVERY – szukam centrali...");
-
+    Serial.println("Discovery – szukam centrali...");
     if (!esp_now_is_peer_exist(broadcastMAC)) {
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, broadcastMAC, 6);
@@ -343,290 +486,326 @@ bool runDiscovery() {
         peer.encrypt = false;
         esp_now_add_peer(&peer);
     }
-
     DiscoveryPacket dp;
     dp.magic = MAGIC_DISCOVERY;
     strncpy(dp.device_id, wagaMAC, sizeof(dp.device_id));
 
-    for (int attempt = 1; attempt <= DISCOVERY_RETRIES; attempt++) {
-        Serial.printf("   Próba %d/%d\n", attempt, DISCOVERY_RETRIES);
+    for (int i = 1; i <= DISCOVERY_RETRIES; i++) {
+        Serial.printf("   Próba %d/%d\n", i, DISCOVERY_RETRIES);
         discoveryDone = false;
         esp_now_send(broadcastMAC, (uint8_t*)&dp, sizeof(dp));
-
         unsigned long t = millis();
-        while (!discoveryDone && millis() - t < DISCOVERY_TIMEOUT_MS) delay(50);
-
+        while (!discoveryDone && millis() - t < DISCOVERY_TIMEOUT_MS) {
+            checkResetAnytime();
+            delay(50);
+        }
         if (discoveryDone) {
             saveCentralaMAC(centralaMACbuf);
             memcpy(rtcCentralaMAC, centralaMACbuf, 6);
             rtcMACValid = true;
             return true;
         }
-        Serial.println("   Brak odpowiedzi, ponawiam...");
         delay(500);
     }
-
-    Serial.println("❌ Discovery nieudane – brak centrali w zasięgu");
+    Serial.println("Discovery nieudane");
     return false;
 }
 
 // ============================================================
-// ================== HX711 ==================
+// ================== HX711 ===================================
 // ============================================================
-void hx711_power_on() { digitalWrite(HX711_VCC_PIN, HIGH); delay(500); }
-void hx711_power_off() { delay(10); digitalWrite(HX711_VCC_PIN, LOW); }
 
 float read_weight() {
-    Serial.println("⚖️ Ważenie...");
-    hx711_power_on();
-    float reading = 0;
+    Serial.println("Ważenie...");
+    pinMode(HX711_VCC_PIN, OUTPUT);
+    pinMode(HX711_GND_PIN, OUTPUT);
+    digitalWrite(HX711_GND_PIN, LOW);
+    digitalWrite(HX711_VCC_PIN, HIGH);
+    scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
+    delay(500);
+
+    float weight = 0.0;
     if (scale.is_ready()) {
-        reading = scale.get_units(5);
+        float reading = scale.get_units(5);
+        weight = (reading - zero) / faktor;
+        if (weight < 0 || weight > 500) weight = 0.0;
+        Serial.printf("Masa: %.2f kg\n", weight);
     } else {
-        Serial.println("❌ HX711 nie odpowiada!");
-        hx711_power_off();
-        return 0.0;
+        Serial.println("HX711 nie odpowiada!");
     }
-    float weight = (reading - zero) / faktor;
-    Serial.printf("✅ Masa: %.2f kg\n", weight);
-    hx711_power_off();
+    delay(10);
+    digitalWrite(HX711_VCC_PIN, LOW);
     return weight;
 }
 
 // ============================================================
-// ================== BATERIA ==================
+// ================== BATERIA =================================
 // ============================================================
+
 float readBatteryVoltage() {
-    delayMicroseconds(1000);
+    analogReadResolution(12);
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
     uint32_t sum = 0;
     for (int i = 0; i < 16; i++) { sum += analogRead(BAT_ADC_PIN); delayMicroseconds(50); }
-    float v = (sum / 16.0f) * 3.3f / 4095.0f * 2.469f;  // kalibracja: *2.469 = *2.0 * (3.85/3.12)
-    Serial.printf("🔋 Bateria: %.2f V\n", v);
+    float v = (sum / 16.0f) * 3.3f / 4095.0f * 2.469f;
+    Serial.printf("Bateria: %.2f V\n", v);
     return v;
 }
 
 // ============================================================
-// ================== SETUP ==================
+// ================== PRESYNC WAKEUP ==========================
 // ============================================================
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    bootCount++;
 
-    // Inkrementuj licznik bootów od wieczornej sync (tylko prawdziwe pomiary, nie retry)
-    if (drift.evening_recorded && retryCycle == 0)
-        drift.boots_since_evening++;
+void handlePresyncWakeup() {
+    Serial.println("\n*** PRESYNC – korekcja czasu z DS3231 ***");
+    checkResetAnytime();
 
-    Serial.println("\n╔════════════════════════════════╗");
-    Serial.println("║    🐝 WAGA PASIECZNA          ║");
-    Serial.printf( "║    Firmware: %-18s║\n", FIRMWARE_VERSION);
-    Serial.printf( "║    Boot #%-22u║\n", bootCount);
-    Serial.println("╚════════════════════════════════╝");
+    time_t now = ds3231GetTime();
 
-    if (timeValid)
-        Serial.printf("🕐 Czas: %s\n", epochToString(savedEpoch).c_str());
-    else
-        Serial.println("⚠️ Czas nieznany");
-
-    // ── SPRAWDŹ PRZYCISK RESET KONFIGURACJI ────────────────
-    pinMode(RESET_BTN_PIN, INPUT_PULLUP);
-    if (digitalRead(RESET_BTN_PIN) == LOW) {
-        Serial.printf("⚠️ Przycisk wciśnięty – trzymaj %ds aby zresetować...\n",
-                      RESET_HOLD_MS / 1000);
-        unsigned long held = millis();
-        while (digitalRead(RESET_BTN_PIN) == LOW && millis() - held < RESET_HOLD_MS)
-            delay(100);
-        if (millis() - held >= RESET_HOLD_MS) {
-            clearConfig();
-            Serial.println("✅ Reset konfiguracji wykonany");
-            delay(1000);
-        } else {
-            Serial.println("ℹ️ Za krótko – reset anulowany");
-        }
+    if (now == 0) {
+        Serial.println("DS3231 niedostępny – fallback timer 1h");
+        sleepTimer(DEFAULT_SLEEP_SEC, WAKEUP_SEND);
+        return;
     }
 
-    // ── KONFIGURACJA SPRZĘTU ───────────────────────────────
-    pinMode(HX711_VCC_PIN, OUTPUT);
-    pinMode(HX711_GND_PIN, OUTPUT);
-    digitalWrite(HX711_GND_PIN, LOW);
-    scale.begin(HX711_DT_PIN, HX711_SCK_PIN);
-    analogReadResolution(12);
-    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+    setSystemTime((uint32_t)now);
 
-    // ── POMIARY ────────────────────────────────────────────
-    // Przy retry używamy danych z pamięci RTC (pomierzonych przy pierwszym starcie)
-    float masa     = 0.0;
-    float napiecie = 0.0;
+    uint8_t sendHour, sendMin;
+    getSendTimeAfterPresync(now, sendHour, sendMin);
+
+    Serial.printf("Presync OK → budzenie do wysłania o %02d:%02d\n", sendHour, sendMin);
+    sleepUntilTime(now, sendHour, sendMin, WAKEUP_SEND);
+}
+
+// ============================================================
+// ================== SEND WAKEUP =============================
+// ============================================================
+
+void handleSendWakeup() {
+    Serial.println("\n*** SEND – pomiar i wysyłanie danych ***");
+    checkResetAnytime();
+
+    // ── POMIARY ──────────────────────────────────────────
+    float masa, napiecie;
     if (retryCycle > 0) {
         masa     = rtcWaga;
         napiecie = rtcBateria;
-        Serial.printf("🔄 Retry %d/%d – dane z RTC: waga=%.2f kg\n",
+        Serial.printf("Retry %d/%d | waga=%.2f kg\n",
                       retryCycle, RETRY_MAX_CYCLES, masa);
     } else {
-        masa     = read_weight();
-        napiecie = readBatteryVoltage();
-        if (masa < 0 || masa > 500) { Serial.println("⚠️ Błędny pomiar – 0.00"); masa = 0.0; }
-        Serial.printf("📦 Dane: waga=%.2f kg, bat=%.2f V\n", masa, napiecie);
-        // Zapisz do RTC na wypadek retry
+        masa       = read_weight();
+        napiecie   = readBatteryVoltage();
         rtcWaga    = masa;
         rtcBateria = napiecie;
-        strncpy(rtcDeviceId, wagaMAC, sizeof(rtcDeviceId));
     }
 
-    // ── ESP-NOW INIT ───────────────────────────────────────
+    // ── ESP-NOW INIT ──────────────────────────────────────
     WiFi.mode(WIFI_STA);
-    // Użyj MAC jako device_id (bez dwukropków, np. FC012CEC7C54)
     String macStr = WiFi.macAddress();
     macStr.replace(":", "");
     strncpy(wagaMAC, macStr.c_str(), sizeof(wagaMAC));
-    Serial.print("📍 MAC wagi (device_id): "); Serial.println(wagaMAC);
+    Serial.printf("MAC wagi: %s\n", wagaMAC);
 
     if (esp_now_init() != ESP_OK) {
-        Serial.println("❌ Błąd ESP-NOW init!");
-        goToSleep(); return;
+        Serial.println("ESP-NOW init failed");
+        goSleepFallback();
+        return;
     }
     esp_now_register_send_cb(onDataSent);
     esp_now_register_recv_cb(onDataRecv);
 
-    // ── USTAL MAC CENTRALI ─────────────────────────────────
-    // Priorytet: pamięć RTC → Preferences → discovery
+    // ── MAC CENTRALI ──────────────────────────────────────
     if (rtcMACValid) {
         memcpy(centralaMACbuf, rtcCentralaMAC, 6);
         macKnown = true;
-        Serial.printf("📋 MAC z RTC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        Serial.printf("MAC z RTC RAM: %02X:%02X:%02X:%02X:%02X:%02X\n",
                       centralaMACbuf[0], centralaMACbuf[1], centralaMACbuf[2],
                       centralaMACbuf[3], centralaMACbuf[4], centralaMACbuf[5]);
     } else if (loadCentralaMAC(centralaMACbuf)) {
         macKnown = true;
         memcpy(rtcCentralaMAC, centralaMACbuf, 6);
         rtcMACValid = true;
-        Serial.printf("📋 MAC z Preferences: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        Serial.printf("MAC z NVS: %02X:%02X:%02X:%02X:%02X:%02X\n",
                       centralaMACbuf[0], centralaMACbuf[1], centralaMACbuf[2],
                       centralaMACbuf[3], centralaMACbuf[4], centralaMACbuf[5]);
     } else {
-        Serial.println("❓ Brak zapisanego MAC – uruchamiam discovery");
         macKnown = runDiscovery();
     }
 
     if (!macKnown) {
-        Serial.println("❌ Nie znaleziono centrali – idę spać");
-        goToSleep(); return;
+        Serial.println("Brak centrali – idę spać");
+        goSleepFallback();
+        return;
     }
 
-    // ── DODAJ CENTRALĘ JAKO PEER ───────────────────────────
+    // ── PEER ─────────────────────────────────────────────
     if (!esp_now_is_peer_exist(centralaMACbuf)) {
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, centralaMACbuf, 6);
         peer.channel = 0;
         peer.encrypt = false;
         if (esp_now_add_peer(&peer) != ESP_OK) {
-            Serial.println("❌ Błąd dodawania peer!");
-            goToSleep(); return;
+            Serial.println("Błąd dodawania peer");
+            goSleepFallback();
+            return;
         }
     }
-    Serial.println("✅ Centrala dodana jako peer");
 
-    // ── PRZYGOTUJ DANE DO WYSŁANIA ────────────────────────
-    DaneWagi dane;
-    dane.magic                = MAGIC_DATA_WAGI;
-    dane.waga                 = masa;
-    dane.bateria              = napiecie;
+    // ── PAKIET DANYCH ────────────────────────────────────
+    DaneWagi dane = {};
+    dane.magic   = MAGIC_DATA_WAGI;
+    dane.waga    = masa;
+    dane.bateria = napiecie;
     strncpy(dane.device_id, wagaMAC, sizeof(dane.device_id));
-    // Wypełnij dane dryfu
-    dane.drift_ppm_avg        = drift.drift_ppm_avg;
-    dane.drift_ppm_last       = drift.drift_ppm_last;
-    dane.drift_syncs          = drift.successful_syncs;
-    dane.drift_boots_since_eve = drift.boots_since_evening;
-    dane.drift_min            = drift.min_drift_seen;
-    dane.drift_max            = drift.max_drift_seen;
 
-    // ── WYŚLIJ DANE (okno SEND_WINDOW_SEC sekund) ─────────
-    Serial.printf("📡 Wysyłanie (okno %ds, próba %d/%d)...\n",
+    // ── WYŚLIJ ───────────────────────────────────────────
+    Serial.printf("Wysyłanie (okno %ds, próba %d/%d)...\n",
                   SEND_WINDOW_SEC, retryCycle + 1, RETRY_MAX_CYCLES);
+    wyslanoPomyslnie = false;
+    timeSyncReceived = false;
     unsigned long sendStart = millis();
     int proba = 0;
-    while (!wyslanoPomyslnie && millis() - sendStart < (uint32_t)SEND_WINDOW_SEC * 1000) {
+    while (millis() - sendStart < (uint32_t)SEND_WINDOW_SEC * 1000) {
         proba++;
         wyslanoPomyslnie = false;
-        esp_now_send(centralaMACbuf, (uint8_t*)&dane, sizeof(dane));
+        esp_err_t sendErr = esp_now_send(centralaMACbuf, (uint8_t*)&dane, sizeof(dane));
+        if (sendErr != ESP_OK) {
+            Serial.printf("esp_now_send error: %d\n", (int)sendErr);
+        }
         Serial.printf("   Próba %d | %lus\n", proba, (millis() - sendStart) / 1000);
         unsigned long tw = millis();
-        while (!wyslanoPomyslnie && millis() - tw < 1000) delay(50);
-        if (!wyslanoPomyslnie) delay(1000);
+        while (!wyslanoPomyslnie && millis() - tw < 1000) {
+            checkResetAnytime();
+            delay(50);
+        }
+        if (wyslanoPomyslnie) break;
+        delay(1000);
     }
 
     if (wyslanoPomyslnie) {
-        // ── SUKCES → czekaj na sync, idź spać do alarmu ───
         retryCycle = 0;
-        Serial.println("\n╔════════════════════════════════╗");
-        Serial.println("║  ✅ DANE WYSŁANE POMYŚLNIE    ║");
-        Serial.println("╚════════════════════════════════╝");
+        Serial.println("DANE WYSŁANE POMYŚLNIE");
 
-        Serial.println("⏳ Czekam na sync czasu (3s)...");
+        uint32_t syncWait = ds3231Synced ? 4000 : 10000;
+        Serial.printf("Czekam na sync czasu (%ums)...\n", syncWait);
         unsigned long tw = millis();
-        while (!timeSyncReceived && millis() - tw < 3000) delay(50);
+        while (!timeSyncReceived && millis() - tw < syncWait) {
+            checkResetAnytime();
+            delay(50);
+        }
 
         if (timeSyncReceived) {
-            savedEpoch = (time_t)receivedTimeSync.epoch;
-            timeValid  = true;
-            Serial.printf("✅ Czas: %s\n", epochToString(savedEpoch).c_str());
+            uint32_t epoch = receivedTimeSync.epoch;
+            setSystemTime(epoch);
+
+            if (ds3231SetTime(epoch)) {
+                if (!ds3231Synced) {
+                    Serial.println("Pierwsza synchronizacja DS3231 zakonczona");
+                } else {
+                    Serial.println("DS3231 zaktualizowany czasem z centrali");
+                }
+                ds3231Synced = true;
+            } else {
+                Serial.println("Nie udalo sie zapisac czasu do DS3231");
+            }
+
+            uint8_t pHour, pMin;
+            getNextScheduledWake((time_t)epoch, pHour, pMin, wakeupMode);
+            Serial.printf("Następny presync o %02d:%02d\n", pHour, pMin);
+            sleepUntilTime((time_t)epoch, pHour, pMin, wakeupMode);
+
         } else {
-            Serial.println("⚠️ Brak sync czasu od centrali");
+            Serial.println("Brak sync czasu od centrali");
+            if (ds3231Synced) {
+                time_t now = ds3231GetTime();
+                if (now > 0) {
+                    setSystemTime((uint32_t)now);
+                    uint8_t pHour, pMin;
+                    getNextScheduledWake(now, pHour, pMin, wakeupMode);
+                    sleepUntilTime(now, pHour, pMin, wakeupMode);
+                    return;
+                }
+            }
+            goSleepFallback();
         }
-        delay(200);
-        goToSleep();
 
     } else {
-        // ── NIEUDANA PRÓBA ─────────────────────────────────
+        // ── RETRY ────────────────────────────────────────
         retryCycle++;
-        if (retryCycle < RETRY_MAX_CYCLES) {
-            Serial.printf("\n⚠️ Brak odpowiedzi – próba %d/%d, sleep %ds\n",
-                          retryCycle, RETRY_MAX_CYCLES, RETRY_SLEEP_SEC);
-            delay(100);
-            esp_sleep_enable_timer_wakeup((uint64_t)RETRY_SLEEP_SEC * 1000000ULL);
-            esp_deep_sleep_start();
+        if (retryCycle < RETRY_MAX_CYCLES_IN_WINDOW) {
+            Serial.printf("Brak odpowiedzi – szybka próba %d/%d, sleep %ds\n",
+                          retryCycle, RETRY_MAX_CYCLES_IN_WINDOW, RETRY_SLEEP_SEC);
+            sleepTimer(RETRY_SLEEP_SEC, WAKEUP_SEND);
+        } else if (retryCycle < RETRY_MAX_CYCLES) {
+            Serial.printf("Okno centrali prawdopodobnie minelo – próba %d/%d, sleep %lus\n",
+                          retryCycle, RETRY_MAX_CYCLES, RETRY_SLEEP_LONG_SEC);
+            sleepTimer(RETRY_SLEEP_LONG_SEC, WAKEUP_SEND);
         } else {
             retryCycle = 0;
-            Serial.println("\n╔════════════════════════════════╗");
-            Serial.println("║  ❌ WYSYŁANIE NIEUDANE        ║");
-            Serial.println("╚════════════════════════════════╝");
-            goToSleep();
+            Serial.println("WYSYŁANIE NIEUDANE – wszystkie próby wyczerpane");
+            goSleepFallback();
         }
     }
 }
 
-
 // ============================================================
-// ================== DEEP SLEEP ==================
+// ================== SETUP ===================================
 // ============================================================
 
-// Normalny sleep do następnego alarmu (6:00 / 20:00)
-void goToSleep() {
-    uint64_t sleepSec;
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    pinMode(DS3231_VCC_PIN, OUTPUT);
+    digitalWrite(DS3231_VCC_PIN, LOW);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
 
-    if (timeValid) {
-        long planned = (long)secondsUntilNextAlarm(savedEpoch);
-        long corrected = applyDriftCorrection(planned);
-        sleepSec = (uint64_t)constrain(corrected, 60L, 86400L);
+    // Interrupt na przycisku reset – aktywny przez cały cykl
+   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(RESET_BTN_PIN), onResetBtn, CHANGE);
+    xTaskCreate(resetTask, "resetTask", 4096, NULL, 1, &resetTaskHandle);
 
-        // Zapisz timestamps do obliczenia dryfu przy następnym wybudzeniu
-        drift.sleep_started_ts  = (uint32_t)savedEpoch;
-        drift.planned_wakeup_ts = (uint32_t)(savedEpoch + (time_t)sleepSec);
+    bootCount++;
 
-        time_t wakeTime = savedEpoch + (time_t)sleepSec;
-        Serial.printf("⏰ Budzę się: %s\n", epochToString(wakeTime).c_str());
-        Serial.printf("💤 Sleep: %llu s (%llu min)\n", sleepSec, sleepSec / 60);
-        savedEpoch += (time_t)sleepSec;
-    } else {
-        sleepSec = DEFAULT_SLEEP_SEC;
-        drift.sleep_started_ts  = 0;
-        drift.planned_wakeup_ts = 0;
-        Serial.printf("💤 Czas nieznany – sleep %lu s\n", sleepSec);
+    Serial.println("\n===================================");
+    Serial.println("       WAGA PASIECZNA");
+    Serial.printf( "   Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.printf( "   Boot #%u\n", bootCount);
+    Serial.println("===================================");
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    bool coldBoot = (cause != ESP_SLEEP_WAKEUP_TIMER && cause != ESP_SLEEP_WAKEUP_GPIO);
+
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        Serial.println(">>> Wybudzenie przez PIN RESET <<<");
     }
 
-    delay(200);
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
-    esp_deep_sleep_start();
+    Serial.printf("Wakeup: %d | mode: %s | DS3231synced: %s | retry: %d\n",
+                  cause,
+                  wakeupMode == WAKEUP_PRESYNC ? "PRESYNC" : "SEND",
+                  ds3231Synced ? "TAK" : "NIE",
+                  retryCycle);
+
+    if (coldBoot) {
+        Serial.println("Zimny start / reset – wymuszam tryb SEND");
+        wakeupMode   = WAKEUP_SEND;
+        retryCycle   = 0;
+        rtcMACValid  = false;
+        ds3231Synced = false;
+    }
+
+    // Sprawdz czy przycisk jest trzymany po wybudzeniu lub starcie.
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        if (handleResetHoldAtBoot("wakeup_gpio")) return;
+    } else if (isResetButtonPressed()) {
+        if (handleResetHoldAtBoot("startup")) return;
+    }
+
+    if (wakeupMode == WAKEUP_PRESYNC) {
+        handlePresyncWakeup();
+    } else {
+        handleSendWakeup();
+    }
 }
 
 void loop() {}

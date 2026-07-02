@@ -1,5 +1,7 @@
 #define TINY_GSM_MODEM_SIM800
 #define SIM800L_IP5306_VERSION_20200811
+// Zmiana: dodano sygnalizacje LED po wyniku wysylki GPRS.
+// Zmiana: 3.2 - usunieto telemetrie dryfu, dodano bezpieczne wylaczanie modemu i adaptacyjny nasluch.
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
@@ -10,14 +12,33 @@
 #include "utilities.h"
 
 // ================== PARAMETRY ==================
-#define FIRMWARE_VERSION      "2.3-DEEPSLEEP"
+#define FIRMWARE_VERSION      "3.2-RTCWAKE"
 #define MAX_SCALES_TOTAL      10
+#define EXPECTED_SCALES       1        // zakończ nasłuch gdy zebrano tyle unikalnych wag
 #define GPRS_MAX_RETRIES      3
 #define GPRS_RETRY_DELAY_MS   10000UL
+static const uint32_t GPRS_NETWORK_TIMEOUT_MS = 30000UL;
+static const uint8_t  GPRS_MIN_USABLE_CSQ = 5;
+static const bool USTAW_ZEGAR = false; // ustaw true, aby przy starcie wymusic zapis czasu kompilacji do DS3231
 
-// ================== CYKL SNU ==================
-#define LISTEN_SEC   20   // czas nasłuchu ESP-NOW [s]
-#define SLEEP_SEC    40   // czas deep sleep [s]
+// ================== CYKL NASŁUCHU ==================
+#define LISTEN_SEC            180      // pelne okno nasluchu ESP-NOW [s]
+#define LISTEN_SEC_MISS_1     120      // okno po pierwszym pustym cyklu
+#define LISTEN_SEC_MISS_MORE  60       // okno po kolejnych pustych cyklach
+#define LISTEN_FULL_EVERY_MISSES 4     // co tyle pustych cykli pelne okno odzyskiwania
+#define LOG_DUMP_WINDOW_MS    1000UL
+
+// ================== GODZINY WYBUDZENIA (DS3231) ==================
+// Dwa alarmy na dobę: 6:00 i 20:00
+static const uint8_t WAKE_HOURS[]   = { 6, 20 };
+static const uint8_t WAKE_MINUTES[] = { 0, 0 };
+static const int     WAKE_COUNT     = 2;
+
+// ================== PIN INT DS3231 → ESP32 ==================
+// Podłącz SQW/INT z DS3231 do tego pinu przez rezystor pull-up 10kΩ do 3.3V
+// Sygnał aktywny LOW → budzimy ESP32 stanem 0
+// RTC_INT_PIN MUSI być GPIO z obsługą ext0: 0,2,4,12-15,25-27,32-39
+#define RTC_INT_PIN   32     // <-- zmień jeśli używasz innego GPIO
 
 // ================== PINY TTGO T-CALL ==================
 #define MODEM_RST        5
@@ -45,8 +66,8 @@ const char USER[]   = "";
 const char PASS[]   = "";
 const char SERVER[] = "srv92298.seohost.com.pl";
 const int  PORT     = 80;
-const char PATH[]   = "/waga_odbior.php";
-const char GATEWAY_ID[] = "CENTRALA_01";
+const char PATH[]   = "/waga/waga_odbior.php";
+const char GATEWAY_ID[] = "CENTRALA_04";
 
 // ================== BATERIA CENTRALI ==================
 #define CENTRAL_BAT_ADC_PIN 35
@@ -63,13 +84,6 @@ typedef struct {
     float    waga;
     float    bateria;
     char     device_id[20];
-    // ── Dane dryfu RTC ──────────────────────────────────
-    int32_t  drift_ppm_avg;
-    int32_t  drift_ppm_last;
-    uint32_t drift_syncs;
-    uint32_t drift_boots_since_eve;
-    int32_t  drift_min;
-    int32_t  drift_max;
 } DaneWagi;
 
 typedef struct {
@@ -89,26 +103,22 @@ typedef struct {
 
 // ================== PAMIĘĆ RTC (przeżywa deep sleep) ==================
 RTC_DATA_ATTR static uint32_t bootCount = 0;
+RTC_DATA_ATTR static uint8_t  lastWakeSlot = 3;   // 1=06:00, 2=20:00, 3=inne/restart
+RTC_DATA_ATTR static uint8_t  emptyListenStreak = 0;
 
 // ================== ZMIENNE GLOBALNE ==================
 volatile bool noweDatane = false;
 DaneWagi      odebraneData;
 uint8_t       lastSenderMAC[6];
 float         centralBatteryVoltage = 0.0;
+int           centralSignalDBm      = 0;
+float centralTemperature    = 0.0;
 
-// Dane wag zebrane w bieżącym cyklu nasłuchu
 struct ScaleData {
     String   device_id;
     float    weight;
     float    battery;
     bool     received;
-    // ── Dane dryfu ──────────────────────────────────────
-    int32_t  drift_ppm_avg;
-    int32_t  drift_ppm_last;
-    uint32_t drift_syncs;
-    uint32_t drift_boots_since_eve;
-    int32_t  drift_min;
-    int32_t  drift_max;
 };
 ScaleData scales[MAX_SCALES_TOTAL];
 int       scaleCount = 0;
@@ -117,9 +127,81 @@ int       scaleCount = 0;
 void logMsg(const String& msg);
 void logf(const char* fmt, ...);
 void logRaw(const String& msg);
+void log_close();
+void goToSleep();
 
 // ============================================================
-// ================== WYSYŁANIE DO WAGI ==================
+// ================== OBLICZ I USTAW NASTĘPNY ALARM RTC =======
+// ============================================================
+/**
+ * Wybiera najbliższy z WAKE_HOURS/WAKE_MINUTES, ustawia Alarm1
+ * DS3231 i zwraca minuty do alarmu (do logów).
+ *
+ * DS3231_A1_Hour = alarm gdy godzina, minuta i sekunda pasują.
+ * Pin SQW/INT przechodzi w LOW gdy alarm się wyzwoli i pozostaje
+ * LOW do momentu wywołania rtc.clearAlarm(1).
+ */
+int setNextRTCAlarm() {
+    DateTime now = rtc.now();
+    int nowMin = now.hour() * 60 + now.minute();
+
+    int bestDiff   = -1;
+    int bestHour   = WAKE_HOURS[0];
+    int bestMinute = WAKE_MINUTES[0];
+    uint8_t bestSlot = 3;
+
+    for (int i = 0; i < WAKE_COUNT; i++) {
+        int alarmMin = WAKE_HOURS[i] * 60 + WAKE_MINUTES[i];
+        int diff     = alarmMin - nowMin;
+        if (diff <= 0) diff += 24 * 60;          // już minął dziś → jutro
+        if (bestDiff < 0 || diff < bestDiff) {
+            bestDiff   = diff;
+            bestHour   = WAKE_HOURS[i];
+            bestMinute = WAKE_MINUTES[i];
+            bestSlot   = (i == 0) ? 1 : 2;
+        }
+    }
+
+    // Wyczyść stare alarmy (zwalnia linię INT jeśli aktywna)
+    rtc.disableAlarm(1);
+    rtc.disableAlarm(2);
+    rtc.clearAlarm(1);
+    rtc.clearAlarm(2);
+
+    // Alarm1: wybudzenie gdy godzina i minuta pasują (sekundy = 0)
+    DateTime alarmTime(now.year(), now.month(), now.day(),
+                       bestHour, bestMinute, 0);
+    rtc.setAlarm1(alarmTime, DS3231_A1_Hour);
+    lastWakeSlot = bestSlot;
+
+    logf("⏰ Alarm RTC ustawiony na %02d:%02d (za %d min)", bestHour, bestMinute, bestDiff);
+    return bestDiff;
+}
+
+// ============================================================
+// ================== DEEP SLEEP ==============================
+// ============================================================
+void goToSleep() {
+    setNextRTCAlarm();
+
+    // Budzenie przez EXT0: pin RTC_INT_PIN, poziom LOW (alarm aktywny LOW)
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)RTC_INT_PIN, 0);
+
+    logMsg(F("💤 Wchodzę w deep sleep – budzenie przez INT DS3231"));
+    log_close();
+    delay(200);
+    esp_deep_sleep_start();
+}
+
+void deepSleepWithoutRTC(uint32_t sec) {
+    Serial.printf("Deep sleep timer %us bez DS3231\n", sec);
+    delay(200);
+    esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+// ============================================================
+// ================== WYSYŁANIE DO WAGI =======================
 // ============================================================
 bool sendToScale(const uint8_t* mac, const uint8_t* data, size_t len) {
     if (!esp_now_is_peer_exist(mac)) {
@@ -136,24 +218,22 @@ void sendDiscoveryResponse(const uint8_t* mac) {
     DiscoveryResponse resp;
     resp.magic = MAGIC_DISC_RESPONSE;
     strncpy(resp.gateway_id, GATEWAY_ID, sizeof(resp.gateway_id));
-    if (sendToScale(mac, (uint8_t*)&resp, sizeof(resp))) {
+    if (sendToScale(mac, (uint8_t*)&resp, sizeof(resp)))
         logf("📡 Discovery response → %02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
 }
 
 void sendTimeSyncToScale(const uint8_t* mac) {
     TimeSyncPacket tp;
     tp.magic = MAGIC_TIME_SYNC;
     tp.epoch = (uint32_t)rtc.now().unixtime();
-    if (sendToScale(mac, (uint8_t*)&tp, sizeof(tp))) {
+    if (sendToScale(mac, (uint8_t*)&tp, sizeof(tp)))
         logf("🕐 Sync czasu → %02X:%02X:%02X:%02X:%02X:%02X | epoch=%u",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], tp.epoch);
-    }
 }
 
 // ============================================================
-// ================== ESP-NOW CALLBACK ==================
+// ================== ESP-NOW CALLBACK ========================
 // ============================================================
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < 1) return;
@@ -175,24 +255,22 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
         memcpy(&odebraneData, data, sizeof(DaneWagi));
         memcpy(lastSenderMAC, mac, 6);
         noweDatane = true;
-
         Serial.println("\n╔═══════════════════════════════════╗");
         Serial.println("║  📥 ODEBRANO DANE OD WAGI        ║");
         Serial.println("╠═══════════════════════════════════╣");
         Serial.printf( "║  ID:      %-24s║\n", odebraneData.device_id);
-        Serial.printf( "║  Waga:    %.2f kg\n", odebraneData.waga);
-        Serial.printf( "║  Bateria: %.2f V\n",  odebraneData.bateria);
+        Serial.printf( "║  Waga:    %.2f kg\n",  odebraneData.waga);
+        Serial.printf( "║  Bateria: %.2f V\n",   odebraneData.bateria);
         Serial.printf( "║  MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         Serial.println("╚═══════════════════════════════════╝\n");
-
         sendTimeSyncToScale(mac);
         return;
     }
 }
 
 // ============================================================
-// ================== LED ==================
+// ================== LED =====================================
 // ============================================================
 void blinkLED(uint8_t count, uint16_t onMs = LED_BLINK_MS, uint16_t offMs = LED_BLINK_MS) {
     for (uint8_t i = 0; i < count; i++) {
@@ -202,12 +280,23 @@ void blinkLED(uint8_t count, uint16_t onMs = LED_BLINK_MS, uint16_t offMs = LED_
     }
 }
 
+void signalSendResult(bool success) {
+    if (success) {
+        blinkLED(3, 150, 150);
+        return;
+    }
+
+    digitalWrite(LED_PIN, HIGH);
+    delay(2000);
+    digitalWrite(LED_PIN, LOW);
+}
+
 // ============================================================
-// ================== LOGOWANIE LittleFS ==================
+// ================== LOGOWANIE LittleFS ======================
 // ============================================================
 #define LOG_DIR       "/logs"
 #define LOG_BOOT_KEY  "/logs/bootcnt"
-#define LOG_MAX_FILES 10
+#define LOG_MAX_FILES 100
 
 File     logFile;
 String   logFilePath = "";
@@ -271,14 +360,14 @@ void log_init() {
     char fname[40];
     sprintf(fname,"%s/boot_%05u.log",LOG_DIR,logBootNum);
     logFilePath = String(fname);
-    logFile = LittleFS.open(logFilePath,"a");  // "a" = append, log żyje przez wiele bootów
+    logFile = LittleFS.open(logFilePath,"a");
     logReady = (bool)logFile;
 }
 
 void log_close() { if (logFile) { logFile.flush(); logFile.close(); } }
 
 // ============================================================
-// ================== RTC ==================
+// ================== RTC HELPERS =============================
 // ============================================================
 String nowStr() {
     DateTime now = rtc.now();
@@ -289,18 +378,9 @@ String nowStr() {
     return String(buf);
 }
 
-void rtc_init() {
-    Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
-    if (!rtc.begin()) { logRaw(F("❌ DS3231 ERROR!")); while(1) delay(10); }
-    if (rtc.lostPower()) {
-        logMsg(F("⚠️ Ustawiam czas RTC..."));
-        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    }
-    rtc.disableAlarm(1); rtc.disableAlarm(2);
-    rtc.clearAlarm(1);   rtc.clearAlarm(2);
-}
-
-// ================== BATERIA CENTRALI ==================
+// ============================================================
+// ================== BATERIA CENTRALI ========================
+// ============================================================
 float readCentralBattery() {
     analogReadResolution(12);
     analogSetPinAttenuation(CENTRAL_BAT_ADC_PIN, ADC_11db);
@@ -309,8 +389,22 @@ float readCentralBattery() {
     return (sum / 16.0 / 4095.0) * 3.3 * 2.0;
 }
 
-// ================== GPRS ==================
+// ============================================================
+// ================== GPRS ====================================
+// ============================================================
 bool gprsConnected = false;
+
+void powerOffGPRSModem() {
+    gsmClient.stop();
+    if (gprsConnected) {
+        modem.gprsDisconnect();
+        delay(500);
+    }
+    modem.poweroff();
+    digitalWrite(MODEM_POWER_ON, LOW);
+    digitalWrite(MODEM_PWRKEY, HIGH);
+    gprsConnected = false;
+}
 
 bool initGPRS() {
     if (gprsConnected) return true;
@@ -322,30 +416,37 @@ bool initGPRS() {
     digitalWrite(MODEM_PWRKEY,   HIGH);
     delay(1000);
     digitalWrite(MODEM_PWRKEY, LOW);
-    if (!modem.waitForNetwork(60000))      { logMsg(F("❌ GPRS: brak sieci")); return false; }
-    if (!modem.gprsConnect(APN,USER,PASS)) { logMsg(F("❌ GPRS: błąd APN"));  return false; }
+    if (!modem.waitForNetwork(GPRS_NETWORK_TIMEOUT_MS)) {
+        logMsg(F("❌ GPRS: brak sieci"));
+        powerOffGPRSModem();
+        return false;
+    }
+    if (!modem.gprsConnect(APN,USER,PASS)) {
+        logMsg(F("❌ GPRS: błąd APN"));
+        powerOffGPRSModem();
+        return false;
+    }
     logMsg(F("✅ GPRS połączony"));
     gprsConnected = true;
     return true;
 }
 
 void disconnectGPRS() {
-    if (!gprsConnected) return;
-    gsmClient.stop();
-    modem.gprsDisconnect();
-    delay(500);
-    modem.poweroff();
-    digitalWrite(MODEM_POWER_ON, LOW);
-    gprsConnected = false;
+    powerOffGPRSModem();
     logMsg(F("📴 GPRS rozłączony"));
 }
 
-// ================== JSON ==================
+// ============================================================
+// ================== JSON ====================================
+// ============================================================
 String buildJson(const String& timestamp) {
     String json = "{";
     json += "\"gateway_id\":\"" + String(GATEWAY_ID) + "\",";
     json += "\"firmware_version\":\"" + String(FIRMWARE_VERSION) + "\",";
     json += "\"gateway_battery\":" + String(centralBatteryVoltage, 2) + ",";
+    json += "\"gateway_signal\":"      + String(centralSignalDBm)      + ",";
+    json += "\"gateway_temperature\":" + String(centralTemperature, 1) + ",";
+    json += "\"w\":" + String(lastWakeSlot) + ",";
     json += "\"timestamp\":\"" + timestamp + "\",";
     json += "\"measurements\":[";
     bool first = true;
@@ -353,24 +454,25 @@ String buildJson(const String& timestamp) {
         if (!scales[i].received) continue;
         if (!first) json += ",";
         first = false;
-        json += "{\"device_id\":\""  + scales[i].device_id                      + "\"," 
-              + "\"weight\":"           + String(scales[i].weight, 2)               + "," 
-              + "\"battery\":"          + String(scales[i].battery, 2)              + "," 
-              + "\"drift_ppm_avg\":"    + String(scales[i].drift_ppm_avg)           + "," 
-              + "\"drift_ppm_last\":"   + String(scales[i].drift_ppm_last)          + "," 
-              + "\"drift_syncs\":"      + String(scales[i].drift_syncs)             + "," 
-              + "\"drift_boots\":"      + String(scales[i].drift_boots_since_eve)   + "," 
-              + "\"drift_min\":"        + String(scales[i].drift_min)               + "," 
-              + "\"drift_max\":"        + String(scales[i].drift_max)               + "}";
+        json += "{\"device_id\":\""  + scales[i].device_id        + "\","
+              + "\"weight\":"       + String(scales[i].weight, 2)  + ","
+              + "\"battery\":"      + String(scales[i].battery, 2) + "}";
     }
     json += "]}";
     return json;
 }
 
-// ================== SEND + RETRY ==================
+// ============================================================
+// ================== HTTP SEND + RETRY =======================
+// ============================================================
 bool sendWithRetry(const String& payload) {
     for (int attempt = 1; attempt <= GPRS_MAX_RETRIES; attempt++) {
         logf("📡 GPRS próba %d/%d", attempt, GPRS_MAX_RETRIES);
+        int csq = modem.getSignalQuality();
+        if (csq != 99 && csq < GPRS_MIN_USABLE_CSQ) {
+            logf("⚠️ Zbyt słaby sygnał GSM (CSQ=%d), pomijam dalsze próby", csq);
+            return false;
+        }
         if (!gsmClient.connect(SERVER, PORT)) {
             logMsg(F("❌ Brak połączenia z serwerem"));
         } else {
@@ -399,119 +501,193 @@ bool sendWithRetry(const String& payload) {
 }
 
 // ============================================================
-// ================== DEEP SLEEP ==================
+// ================== PĘTLA NASŁUCHU ESP-NOW ==================
 // ============================================================
-void goToSleep() {
-    log_close();
-    logf("💤 Deep sleep %ds", SLEEP_SEC);
-    delay(100);
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_SEC * 1000000ULL);
-    esp_deep_sleep_start();
+/**
+ * Nasłuchuje przez max LISTEN_SEC sekund LUB do zebrania
+ * EXPECTED_SCALES unikalnych wag — co nastąpi pierwsze.
+ */
+uint16_t currentListenWindowSec() {
+    if (emptyListenStreak == 0) return LISTEN_SEC;
+    if (emptyListenStreak % LISTEN_FULL_EVERY_MISSES == 0) return LISTEN_SEC;
+    if (emptyListenStreak == 1) return LISTEN_SEC_MISS_1;
+    return LISTEN_SEC_MISS_MORE;
 }
 
-// ============================================================
-// ================== SETUP ==================
-// ============================================================
-void setup() {
-    Serial.begin(115200);
-    delay(500);
-    setupPMU();
-    delay(300);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
-
-    // RTC i log przy każdym wybudzeniu
-    Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
-    if (!rtc.begin()) { Serial.println("❌ DS3231 ERROR!"); while(1) delay(10); }
-    if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-
-    log_init();
-    bootCount++;
-
-    // Pokaż nagłówek tylko przy pierwszym starcie (nie przy każdym wybudzeniu)
-    if (bootCount == 1) {
-        logRaw(F("\n╔════════════════════════════════╗"));
-        logRaw(F("║  🐝 CENTRALA PASIECZNA        ║"));
-        logRaw(F("║  Firmware: " FIRMWARE_VERSION "   ║"));
-        logRaw(F("╚════════════════════════════════╝"));
-    }
-
-    logf("⏰ Boot #%u | %s", bootCount, nowStr().c_str());
-
-    // ── ESP-NOW INIT ───────────────────────────────────────
-    WiFi.mode(WIFI_STA);
-
-    if (esp_now_init() != ESP_OK) {
-        logMsg(F("❌ Błąd ESP-NOW init!"));
-        goToSleep(); return;
-    }
-    esp_now_register_recv_cb(onDataRecv);
-
-    // ── NASŁUCH PRZEZ LISTEN_SEC SEKUND ───────────────────
-    logf("👂 Nasłuchuję %ds...", LISTEN_SEC);
-    blinkLED(1, 50, 50);
-
+void listenForScales() {
     scaleCount = 0;
     noweDatane = false;
-    String timestamp = nowStr();
     unsigned long listenStart = millis();
+    uint16_t listenSec = currentListenWindowSec();
 
-    while (millis() - listenStart < (uint32_t)LISTEN_SEC * 1000) {
+    logf("👂 Nasłuchuję max %us | cel: %d wag | puste cykle=%u",
+         listenSec, EXPECTED_SCALES, emptyListenStreak);
+    blinkLED(1, 50, 50);
+
+    while (millis() - listenStart < (uint32_t)listenSec * 1000) {
+
+        // Warunek wyjścia: zebrano oczekiwaną liczbę wag
+        if (scaleCount >= EXPECTED_SCALES) {
+            logf("🎯 Zebrano %d/%d wag – kończę nasłuch wcześniej (%.1fs)",
+                 scaleCount, EXPECTED_SCALES,
+                 (millis() - listenStart) / 1000.0);
+            break;
+        }
+
         if (noweDatane) {
             noweDatane = false;
 
             bool juzMamy = false;
             for (int i = 0; i < scaleCount; i++) {
                 if (scales[i].device_id == String(odebraneData.device_id)) {
-                    scales[i].weight              = odebraneData.waga;
-                    scales[i].battery             = odebraneData.bateria;
-                    scales[i].received            = true;
-                    scales[i].drift_ppm_avg       = odebraneData.drift_ppm_avg;
-                    scales[i].drift_ppm_last      = odebraneData.drift_ppm_last;
-                    scales[i].drift_syncs         = odebraneData.drift_syncs;
-                    scales[i].drift_boots_since_eve = odebraneData.drift_boots_since_eve;
-                    scales[i].drift_min           = odebraneData.drift_min;
-                    scales[i].drift_max           = odebraneData.drift_max;
+                    // Aktualizuj istniejącą wagę
+                    scales[i].weight               = odebraneData.waga;
+                    scales[i].battery              = odebraneData.bateria;
+                    scales[i].received             = true;
                     juzMamy = true;
-                    logf("🔄 Aktualizacja: %s = %.2f kg",
-                         odebraneData.device_id, odebraneData.waga);
+                    logf("🔄 Aktualizacja: %s = %.2f kg", odebraneData.device_id, odebraneData.waga);
                     break;
                 }
             }
             if (!juzMamy && scaleCount < MAX_SCALES_TOTAL) {
-                scales[scaleCount].device_id           = String(odebraneData.device_id);
-                scales[scaleCount].weight              = odebraneData.waga;
-                scales[scaleCount].battery             = odebraneData.bateria;
-                scales[scaleCount].received            = true;
-                scales[scaleCount].drift_ppm_avg       = odebraneData.drift_ppm_avg;
-                scales[scaleCount].drift_ppm_last      = odebraneData.drift_ppm_last;
-                scales[scaleCount].drift_syncs         = odebraneData.drift_syncs;
-                scales[scaleCount].drift_boots_since_eve = odebraneData.drift_boots_since_eve;
-                scales[scaleCount].drift_min           = odebraneData.drift_min;
-                scales[scaleCount].drift_max           = odebraneData.drift_max;
-                logf("✅ Nowa waga [%d]: %s = %.2f kg",
-                     scaleCount + 1, odebraneData.device_id, odebraneData.waga);
+                int idx = scaleCount;
+                scales[idx].device_id              = String(odebraneData.device_id);
+                scales[idx].weight                 = odebraneData.waga;
+                scales[idx].battery                = odebraneData.bateria;
+                scales[idx].received               = true;
                 scaleCount++;
+                logf("✅ Nowa waga [%d/%d]: %s = %.2f kg",
+                     scaleCount, EXPECTED_SCALES,
+                     odebraneData.device_id, odebraneData.waga);
             }
             blinkLED(1, 30, 30);
         }
         delay(50);
     }
 
-    // ── WYŚLIJ GPRS JEŚLI MAMY DANE, INACZEJ OD RAZU ŚPIJ ─
     if (scaleCount > 0) {
-        logf("📶 Odebrano od %d wag – wysyłam GPRS", scaleCount);
-        centralBatteryVoltage = readCentralBattery();
-        if (initGPRS()) {
-            String json = buildJson(timestamp);
-            logRaw("📦 JSON: " + json);
-            sendWithRetry(json);
-            disconnectGPRS();
-        }
-    } else {
-        logMsg(F("⚠️ Brak danych – idę spać"));
+        emptyListenStreak = 0;
+    } else if (emptyListenStreak < 250) {
+        emptyListenStreak++;
     }
 
+    logf("📊 Nasłuch zakończony: %d wag, czas=%.1fs",
+         scaleCount, (millis() - listenStart) / 1000.0);
+}
+
+// ============================================================
+// ================== SETUP ===================================
+// ============================================================
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    setupPMU();
+    delay(300);
+
+    pinMode(LED_PIN,     OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    // Pin INT DS3231 – wejście z pull-up wewnętrznym ESP32
+    // (zewnętrzny rezystor pull-up 10kΩ do 3.3V też zalecany)
+    pinMode(RTC_INT_PIN, INPUT_PULLUP);
+
+    // ── RTC INIT ──────────────────────────────────────────
+    Wire.begin(RTC_SDA_PIN, RTC_SCL_PIN);
+    if (!rtc.begin()) {
+        Serial.println("❌ DS3231 ERROR!");
+        deepSleepWithoutRTC(3600UL);
+    }
+    if (USTAW_ZEGAR) {
+        Serial.println("?? Wymuszam ustawienie RTC czasem kompilacji");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    } else if (rtc.lostPower()) {
+        Serial.println("⚠️ RTC stracił zasilanie – ustawiam czas kompilacji");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+
+    // WAŻNE: wyczyść flagę alarmu DS3231 zaraz po przebudzeniu
+    // aby zwolnić linię INT (która jest active-low i trzymana LOW
+    // dopóki alarm nie zostanie skasowany)
+    rtc.clearAlarm(1);
+    rtc.clearAlarm(2);
+    rtc.disableAlarm(2);  // Alarm2 nieużywany
+
+    // ── LOG INIT ──────────────────────────────────────────
+    log_init();
+    bootCount++;
+
+    Serial.println("Wyślij 'L' w ciągu 1s aby zobaczyć logi...");
+    unsigned long t = millis();
+    while (millis() - t < LOG_DUMP_WINDOW_MS) {
+        if (Serial.available() && Serial.read() == 'L') {
+            File dir = LittleFS.open("/logs");
+            File f = dir.openNextFile();
+            while (f) {
+                Serial.println("=== " + String(f.name()) + " ===");
+                while (f.available()) Serial.write(f.read());
+                f.close();
+                f = dir.openNextFile();
+            }
+        }
+    }
+    // Powód wybudzenia
+    esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
+
+    if (bootCount == 1 || wakeReason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        logRaw(F("\n╔════════════════════════════════╗"));
+        logRaw(F("║  🐝 CENTRALA PASIECZNA        ║"));
+        logRaw(F("║  Firmware: " FIRMWARE_VERSION "     ║"));
+        logRaw(F("╚════════════════════════════════╝"));
+        logMsg(F("🔌 Pierwsze uruchomienie / reset sprzętowy"));
+        lastWakeSlot = 3;
+    }
+
+    if (wakeReason == ESP_SLEEP_WAKEUP_EXT0) {
+        logMsg(F("⏰ Wybudzenie przez INT DS3231 (alarm RTC)"));
+    } else {
+        lastWakeSlot = 3;
+    }
+
+    logf("⏰ Boot #%u | %s | w=%u", bootCount, nowStr().c_str(), lastWakeSlot);
+
+    // ── ESP-NOW INIT ───────────────────────────────────────
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() != ESP_OK) {
+        logMsg(F("❌ Błąd ESP-NOW init!"));
+        goToSleep();
+        return;
+    }
+    esp_now_register_recv_cb(onDataRecv);
+
+    // ── NASŁUCH: 2 minuty LUB EXPECTED_SCALES wag ─────────
+    String timestamp = nowStr();
+    listenForScales();
+    esp_now_deinit();
+    WiFi.mode(WIFI_OFF);
+
+    // ── WYŚLIJ GPRS ZAWSZE (dane wag lub samo napięcie centrali) ──
+    centralBatteryVoltage = readCentralBattery();
+    centralTemperature    = rtc.getTemperature();
+    logf("🌡️ Temperatura RTC: %.1f°C", centralTemperature);
+    if (scaleCount > 0) {
+        logf("📶 Odebrano od %d wag – wysyłam GPRS", scaleCount);
+    } else {
+        logMsg(F("⚠️ Brak danych od wag – wysyłam samo napięcie centrali"));
+    }
+    if (initGPRS()) {
+        int csq = modem.getSignalQuality();
+        centralSignalDBm = (csq == 99) ? 0 : csq;
+        logf("📶 Zasięg GSM: CSQ=%d", centralSignalDBm);
+        String json = buildJson(timestamp);
+        logRaw("📦 JSON: " + json);
+        bool sendOk = sendWithRetry(json);
+        disconnectGPRS();
+        signalSendResult(sendOk);
+    } else {
+        signalSendResult(false);
+    }
+
+    // ── DEEP SLEEP DO NASTĘPNEGO ALARMU DS3231 ─────────────
     goToSleep();
 }
 
