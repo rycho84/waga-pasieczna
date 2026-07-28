@@ -2,6 +2,7 @@
 #define SIM800L_IP5306_VERSION_20200811
 // Zmiana: dodano sygnalizacje LED po wyniku wysylki GPRS.
 // Zmiana: 3.2 - usunieto telemetrie dryfu, dodano bezpieczne wylaczanie modemu i adaptacyjny nasluch.
+// Zmiana: 3.3 - dodano tymczasowa obsluge starych pakietow wag z polami dryfu.
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
@@ -12,7 +13,7 @@
 #include "utilities.h"
 
 // ================== PARAMETRY ==================
-#define FIRMWARE_VERSION      "3.2-RTCWAKE"
+#define FIRMWARE_VERSION      "3.3-RTCWAKE"
 #define MAX_SCALES_TOTAL      10
 #define EXPECTED_SCALES       1        // zakończ nasłuch gdy zebrano tyle unikalnych wag
 #define GPRS_MAX_RETRIES      3
@@ -67,7 +68,7 @@ const char PASS[]   = "";
 const char SERVER[] = "srv92298.seohost.com.pl";
 const int  PORT     = 80;
 const char PATH[]   = "/waga/waga_odbior.php";
-const char GATEWAY_ID[] = "CENTRALA_04";
+const char GATEWAY_ID[] = "CENTRALA_05";
 
 // ================== BATERIA CENTRALI ==================
 #define CENTRAL_BAT_ADC_PIN 35
@@ -85,6 +86,19 @@ typedef struct {
     float    bateria;
     char     device_id[20];
 } DaneWagi;
+
+typedef struct {
+    uint8_t  magic;
+    float    waga;
+    float    bateria;
+    char     device_id[20];
+    int32_t  drift_ppm_avg;
+    int32_t  drift_ppm_last;
+    uint32_t drift_syncs;
+    uint32_t drift_boots_since_eve;
+    int32_t  drift_min;
+    int32_t  drift_max;
+} DaneWagiLegacy;
 
 typedef struct {
     uint8_t magic;
@@ -251,8 +265,18 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    if (magic == MAGIC_DATA_WAGI && len == sizeof(DaneWagi)) {
-        memcpy(&odebraneData, data, sizeof(DaneWagi));
+    if (magic == MAGIC_DATA_WAGI &&
+        (len == sizeof(DaneWagi) || len == sizeof(DaneWagiLegacy))) {
+        if (len == sizeof(DaneWagiLegacy)) {
+            const DaneWagiLegacy* legacy = (const DaneWagiLegacy*)data;
+            odebraneData.magic = legacy->magic;
+            odebraneData.waga = legacy->waga;
+            odebraneData.bateria = legacy->bateria;
+            strncpy(odebraneData.device_id, legacy->device_id, sizeof(odebraneData.device_id));
+            odebraneData.device_id[sizeof(odebraneData.device_id) - 1] = '\0';
+        } else {
+            memcpy(&odebraneData, data, sizeof(DaneWagi));
+        }
         memcpy(lastSenderMAC, mac, 6);
         noweDatane = true;
         Serial.println("\n╔═══════════════════════════════════╗");

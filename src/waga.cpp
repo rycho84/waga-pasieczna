@@ -1,4 +1,4 @@
-// Zmiana: 5.3 - usunieto telemetrie dryfu, odblokowano cykliczna synchronizacje DS3231 i ograniczono retry poza oknem centrali.
+// Zmiana: 5.4 - dodano wyswietlanie parametrow kalibracji HX711 przy starcie.
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
@@ -11,13 +11,12 @@
 #include "driver/gpio.h"
 
 // ================== WERSJA ==================
-#define FIRMWARE_VERSION "5.3-RESET-IRQ"
+#define FIRMWARE_VERSION "5.4-RESET-IRQ"
 
 // ================== PINY HX711 ==================
 #define HX711_DT_PIN    2
 #define HX711_SCK_PIN   3
 #define HX711_VCC_PIN   4
-#define HX711_GND_PIN   5
 
 // ================== PINY DS3231 ==================
 // INT/SQW NIE jest podłączony – budzenie wyłącznie przez timer ESP
@@ -32,7 +31,7 @@
 #define ONBOARD_LED_PIN 15
 
 // ================== KALIBRACJA WAGI ==================
-const float zero   = 1154100;
+const float zero   = 1190501;
 const float faktor = -21600;
 
 // ================== BATERIA ==================
@@ -770,6 +769,7 @@ void setup() {
     Serial.println("\n===================================");
     Serial.println("       WAGA PASIECZNA");
     Serial.printf( "   Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.printf( "   Kalibracja: zero=%.0f | faktor=%.0f\n", zero, faktor);
     Serial.printf( "   Boot #%u\n", bootCount);
     Serial.println("===================================");
 
